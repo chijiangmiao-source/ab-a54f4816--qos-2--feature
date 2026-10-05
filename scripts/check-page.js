@@ -35,8 +35,19 @@ check('含逐包证据区(会话阶段/包标识/首次交付/违规依据)',
 check('含已固化证据列表', /id="caseList"/.test(html));
 check('展示首个违规包序号', /reasonSeq|首个违规包序号/.test(html));
 
+// 首发链路追溯要素
+check('含可追溯首发选择区', /id="originChips"/.test(html));
+check('含链路追溯结果区', /id="chainBody"/.test(html) && /id="boundaryBox"/.test(html));
+check('逐包首发提供追溯入口', /data-trace=/.test(html) && /可追溯首发/.test(html));
+check('链路含连接编号/阶段变化/确认关系/唯一交付列',
+  /连接/.test(html) && /阶段变化/.test(html) && /确认关系/.test(html) && /唯一交付/.test(html));
+check('调用首发清单接口', html.includes('/trace-origins'));
+check('调用链路追溯接口', html.includes('/trace/'));
+check('体现跨连接恢复(Clean Start=0/Session Present=1)', /Clean Start=0/.test(html) && /Session Present=1/.test(html));
+check('体现标识复用边界提示', /REUSED_BY_NEW_ORIGIN|标识被新的首发重用|标识复用边界/.test(html));
+
 // 场景模板
-['normal', 'pubrecLost', 'pubcompLost', 'double', 'cleanstart', 'payload', 'unclosed', 'direrr']
+['normal', 'pubrecLost', 'pubcompLost', 'double', 'cleanstart', 'payload', 'unclosed', 'reuse', 'direrr']
   .forEach((p) => check(`场景模板 ${p}`, html.includes(`data-preset="${p}"`)));
 
 // API 调用存在

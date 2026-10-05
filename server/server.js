@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { EvidenceStore, StoreError } from './store.js';
-import { InputValidationError, REASON_CODES } from './engine.js';
+import { InputValidationError, REASON_CODES, listTraceOrigins, buildTraceChain, TraceQueryError } from './engine.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 8080);
@@ -83,6 +83,55 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'GET' && path === '/api/audits') {
       send(res, 200, { audits: await store.list() });
+      return;
+    }
+
+    // ---------- 首发链路追溯（只读派生，绝不改写冻结证据） ----------
+    // 可追溯首发选择清单
+    const originsMatch = path.match(/^\/api\/audits\/([^/]+)\/trace-origins$/);
+    if (req.method === 'GET' && originsMatch) {
+      const rec = await store.get(decodeURIComponent(originsMatch[1]));
+      if (!rec) {
+        send(res, 404, { status: 'NOT_FOUND', code: 'AUDIT_ID_NOT_FOUND', message: '该审计标识无已固化裁决，无法列出发送链路首发' });
+        return;
+      }
+      const verdict = rec.evidence.verdict;
+      send(res, 200, {
+        status: 'OK',
+        auditId: rec.auditId,
+        caseId: rec.caseId,
+        sealedAt: rec.sealedAt,
+        packetCount: verdict.packets.length,
+        traceOrigins: listTraceOrigins(verdict)
+      });
+      return;
+    }
+
+    // 从某首发包起的完整有序链路
+    const traceMatch = path.match(/^\/api\/audits\/([^/]+)\/trace\/([^/]+)$/);
+    if (req.method === 'GET' && traceMatch) {
+      const rec = await store.get(decodeURIComponent(traceMatch[1]));
+      if (!rec) {
+        send(res, 404, { status: 'NOT_FOUND', code: 'AUDIT_ID_NOT_FOUND', message: '该审计标识无已固化裁决，无法追溯交换链路' });
+        return;
+      }
+      try {
+        const chain = buildTraceChain(rec.evidence.verdict, decodeURIComponent(traceMatch[2]));
+        send(res, 200, {
+          status: 'OK',
+          auditId: rec.auditId,
+          caseId: rec.caseId,
+          sealedAt: rec.sealedAt,
+          chain
+        });
+      } catch (err) {
+        if (err instanceof TraceQueryError) {
+          // 查询错误只反馈，不触碰冻结证据
+          send(res, 400, { status: 'INVALID_TRACE_QUERY', code: err.code, message: err.message });
+          return;
+        }
+        throw err;
+      }
       return;
     }
 

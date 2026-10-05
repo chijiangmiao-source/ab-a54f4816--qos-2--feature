@@ -197,6 +197,141 @@ try {
   const one = await (await fetch(base + '/api/audits/' + encodeURIComponent(uid('SMOKE-LEGAL-ONCE')))).json();
   check('原证据保留: 合法重发案例仍 ACCEPTED',
     one.record.evidence.verdict.verdict === 'ACCEPTED');
+
+  // ================= 首发交换链路追溯（真实只读接口） =================
+  const apiGet = async (p) => {
+    const r = await fetch(base + p);
+    return { status: r.status, json: await r.json() };
+  };
+
+  // 14. 正常闭合链路
+  {
+    const id = uid('SMOKE-TRACE-NORMAL');
+    const body = { auditId: id, clientId: 'c',
+      packets: [C(true), CA(false), P(1), REC(1), REL(1), COMP(1), DISC()] };
+    const seal = await api('/api/audits', body);
+    const o = await apiGet(`/api/audits/${encodeURIComponent(id)}/trace-origins`);
+    check('正常闭合: 首发清单仅首发#3 CLOSED',
+      o.status === 200 && o.json.traceOrigins.length === 1 &&
+      o.json.traceOrigins[0].originSeq === 3 && o.json.traceOrigins[0].status === 'CLOSED' &&
+      o.json.traceOrigins[0].deliverySeq === 6);
+    const t = await apiGet(`/api/audits/${encodeURIComponent(id)}/trace/3`);
+    const c = t.json.chain;
+    check('正常闭合: 链路 CLOSED@6 且唯一交付',
+      t.status === 200 && c.endReason === 'CLOSED' && c.endSeq === 6 &&
+      c.uniqueDelivery.produced === true && c.uniqueDelivery.deliverySeq === 6);
+    const real = c.steps.filter((s) => !s.bridge).map((s) => s.seq);
+    check('正常闭合: 有序成员 3..6', JSON.stringify(real) === JSON.stringify([3, 4, 5, 6]), JSON.stringify(real));
+    check('正常闭合: 逐项带连接编号/阶段变化/确认关系',
+      c.steps.every((s) => Number.isInteger(s.connection) && !!s.phaseChange) &&
+      c.steps.find((s) => s.seq === 5).acknowledgesSeq === 4 &&
+      c.steps.find((s) => s.seq === 6).acknowledgesSeq === 5);
+    check('正常闭合: 标记 frozen（派生只读）', c.frozen === true);
+  }
+
+  // 15. 跨重连恢复链路（PUBCOMP 丢失，CS=0/SP=1，重传 PUBREL 跨连接衔接）
+  {
+    const id = uid('SMOKE-TRACE-RECOVER');
+    const body = { auditId: id, clientId: 'c', packets: [
+      C(false), CA(false), P(22), REC(22), REL(22), DISC(142),
+      C(false), CA(true), REL(22), COMP(22), DISC()] };
+    await api('/api/audits', body);
+    const t = await apiGet(`/api/audits/${encodeURIComponent(id)}/trace/3`);
+    const c = t.json.chain;
+    check('跨重连: CLOSED@10 仍唯一交付',
+      c.endReason === 'CLOSED' && c.uniqueDelivery.produced === true && c.uniqueDelivery.deliverySeq === 10);
+    const bridges = c.steps.filter((s) => s.bridge).map((s) => s.seq);
+    check('跨重连: 桥接含 CONNECT#2(7)/CONNACK(8)', JSON.stringify(bridges) === JSON.stringify([7, 8]));
+    const connStep = c.steps.find((s) => s.seq === 7);
+    const ackStep = c.steps.find((s) => s.seq === 8);
+    const retry = c.steps.find((s) => s.seq === 9);
+    check('跨重连: 桥接 CS=0 + SP=1', connStep.cleanStart === false && ackStep.sessionPresent === true);
+    check('跨重连: 重传 PUBREL 跨连接并重传第5包',
+      retry.crossConnection === true && retry.ackRole === 'PUBREL_RETRY' && retry.retransmitsSeq === 5);
+    check('跨重连: 说明沿用第3包首次交付', /沿用第 3 包首发/.test(retry.crossRecovery));
+    check('跨重连: 首发连接1→重传连接2',
+      c.steps.find((s) => s.seq === 3).connection === 1 && retry.connection === 2);
+  }
+
+  // 16. 标识复用边界：旧链被 Clean Start 终止，新首发独立闭合，两链互不混淆
+  {
+    const id = uid('SMOKE-TRACE-REUSE');
+    const body = { auditId: id, clientId: 'c', packets: [
+      C(false), CA(false), P(8), REC(8), DISC(),
+      C(true), CA(false), P(8), REC(8), REL(8), COMP(8), DISC()] };
+    const seal = await api('/api/audits', body);
+    check('标识复用: 整案仍可固化(新链合法)', seal.status === 201);
+    const o = await apiGet(`/api/audits/${encodeURIComponent(id)}/trace-origins`);
+    check('标识复用: 同标识列出两个首发(3 与 8)',
+      o.json.traceOrigins.length === 2 &&
+      JSON.stringify(o.json.traceOrigins.map((x) => x.originSeq)) === JSON.stringify([3, 8]));
+    const oldT = await apiGet(`/api/audits/${encodeURIComponent(id)}/trace/3`);
+    const oldC = oldT.json.chain;
+    check('旧链: 被 Clean Start 终止@6', oldC.endReason === 'TERMINATED_CLEAN_START' && oldC.endSeq === 6);
+    check('旧链: 不含新首发/新确认(8..11)',
+      oldC.steps.filter((s) => !s.bridge).every((s) => s.seq < 8));
+    check('旧链: 边界指向新首发且不并入',
+      oldC.boundaryEvents.some((b) => b.seq === 8 && b.relation === 'REUSED_BY_NEW_ORIGIN' && b.otherOriginSeq === 8));
+    check('旧链: 无唯一交付', oldC.uniqueDelivery.produced === false);
+    const newT = await apiGet(`/api/audits/${encodeURIComponent(id)}/trace/8`);
+    const newC = newT.json.chain;
+    check('新链: 独立 CLOSED@11 唯一交付',
+      newC.endReason === 'CLOSED' && newC.uniqueDelivery.deliverySeq === 11 &&
+      JSON.stringify(newC.steps.filter((s) => !s.bridge).map((s) => s.seq)) === JSON.stringify([8, 9, 10, 11]));
+  }
+
+  // 17. 闭合后重用标识：前一链止于闭合，重用为边界
+  {
+    const id = uid('SMOKE-TRACE-AFTERCLOSE');
+    const body = { auditId: id, clientId: 'c',
+      packets: [C(true), CA(false), P(5), REC(5), REL(5), COMP(5), P(5, { dup: true })] };
+    await api('/api/audits', body);
+    const t = await apiGet(`/api/audits/${encodeURIComponent(id)}/trace/3`);
+    const c = t.json.chain;
+    check('闭合后重用: 链止于闭合@6', c.endReason === 'CLOSED' && c.endSeq === 6);
+    check('闭合后重用: 重发包#7 仅作 REUSE_AFTER_CLOSE 边界',
+      !c.steps.some((s) => s.seq === 7) &&
+      c.boundaryEvents.some((b) => b.seq === 7 && b.relation === 'REUSE_AFTER_CLOSE'));
+  }
+
+  // 18. 错误查询：未知审计 / 越界序号 / 非首发 / 非整数，均明确反馈且证据不变
+  {
+    const id = uid('SMOKE-TRACE-ERRORS');
+    const body = { auditId: id, clientId: 'c',
+      packets: [C(true), CA(false), P(1), REC(1), REL(1), COMP(1), DISC()] };
+    await api('/api/audits', body);
+    const nf = await apiGet('/api/audits/NO-SUCH-AUDIT-999/trace-origins');
+    check('未知审计: 首发清单 404', nf.status === 404 && nf.json.code === 'AUDIT_ID_NOT_FOUND');
+    const nf2 = await apiGet('/api/audits/NO-SUCH-AUDIT-999/trace/3');
+    check('未知审计: 链路 404', nf2.status === 404 && nf2.json.code === 'AUDIT_ID_NOT_FOUND');
+    const oor = await apiGet(`/api/audits/${encodeURIComponent(id)}/trace/99`);
+    check('越界序号: 400 ORIGIN_SEQ_OUT_OF_RANGE',
+      oor.status === 400 && oor.json.code === 'ORIGIN_SEQ_OUT_OF_RANGE');
+    const neg = await apiGet(`/api/audits/${encodeURIComponent(id)}/trace/0`);
+    check('序号0: 400 越界', neg.status === 400 && neg.json.code === 'ORIGIN_SEQ_OUT_OF_RANGE');
+    const notOrigin = await apiGet(`/api/audits/${encodeURIComponent(id)}/trace/4`);
+    check('非首发(PUBREC): 400 NOT_TRACEABLE_ORIGIN',
+      notOrigin.status === 400 && notOrigin.json.code === 'NOT_TRACEABLE_ORIGIN');
+    const nan = await apiGet(`/api/audits/${encodeURIComponent(id)}/trace/abc`);
+    check('非整数序号: 400 ORIGIN_SEQ_INVALID',
+      nan.status === 400 && nan.json.code === 'ORIGIN_SEQ_INVALID');
+  }
+
+  // 19. 错误链路查询不改写冻结证据：记录数与哈希链不变，原证据可回放
+  {
+    const id = uid('SMOKE-TRACE-READONLY');
+    const body = { auditId: id, clientId: 'c',
+      packets: [C(true), CA(false), P(1), REC(1), REL(1), COMP(1), DISC()] };
+    const sealed = await api('/api/audits', body);
+    const caseId = sealed.json.record.caseId;
+    await apiGet(`/api/audits/${encodeURIComponent(id)}/trace/99`);
+    await apiGet(`/api/audits/${encodeURIComponent(id)}/trace/4`);
+    const t = await apiGet(`/api/audits/${encodeURIComponent(id)}/trace/3`);
+    check('只读: 错误查询后正常链路仍返回同一裁决编号', t.json.caseId === caseId);
+    const re = await api('/api/audits/reopen', body);
+    check('只读: 原证据仍可 REPLAYED 且编号不变',
+      re.status === 200 && re.json.status === 'REPLAYED' && re.json.record.caseId === caseId);
+  }
 } catch (e) {
   check('冒烟执行无异常: ' + e.message, false, e.stack);
 } finally {

@@ -73,6 +73,20 @@
   .flagbox input{ width:auto; }
   .summary{ display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
   .summary span{ background:var(--panel2); border:1px solid var(--line); border-radius:6px; padding:2px 9px; font-size:12px; }
+  .trace-btn{ background:#14532d; color:#d1fae5; border:1px solid #166534; border-radius:5px; padding:1px 7px;
+              font-size:11px; cursor:pointer; margin-top:3px; }
+  .trace-btn:hover{ filter:brightness(1.25); }
+  .chain-end{ border-radius:8px; padding:10px 12px; margin:10px 0; border:1px solid; font-size:13px; }
+  .chain-end.CLOSED{ background:rgba(52,211,153,.08); border-color:rgba(52,211,153,.45); color:var(--ok); }
+  .chain-end.REJECTED,.chain-end.CAPTURE_END_UNCLOSED,.chain-end.TERMINATED_CLEAN_START,.chain-end.CAPTURE_END{
+    background:rgba(248,113,113,.08); border-color:rgba(248,113,113,.45); color:#fecaca; }
+  .origin-chips{ display:flex; flex-wrap:wrap; gap:6px; margin:8px 0; }
+  .origin-chips button{ background:#1d3355; font-size:12px; padding:4px 10px; }
+  .origin-chips button.active{ background:var(--accent2); }
+  .step-bridge td{ color:var(--muted); background:rgba(96,165,250,.06); }
+  .step-cross td{ box-shadow:inset 3px 0 0 var(--warn); }
+  .boundbox{ margin-top:10px; border:1px dashed var(--line); border-radius:8px; padding:8px 12px; font-size:12.5px; }
+  .boundbox li{ margin:3px 0; }
 </style>
 </head>
 <body>
@@ -99,6 +113,7 @@
       <button data-preset="cleanstart">CleanStart后旧确认</button>
       <button data-preset="payload">重发载荷冲突</button>
       <button data-preset="unclosed">断链未闭合</button>
+      <button data-preset="reuse">标识复用边界</button>
       <button data-preset="direrr">方向错误</button>
     </div>
 
@@ -137,8 +152,29 @@
 </div>
 
 <div class="wrap" style="padding-top:0">
+  <!-- ============ 首发链路追溯 ============ -->
+  <section class="card">
+    <h2>③ 首发交换链路追溯（从某条首发 PUBLISH 起的完整有序链路）</h2>
+    <div id="traceHint" class="muted">取得裁决后，在上方逐包结果中点击标记为「可追溯首发」的 PUBLISH，或在此选择首发。链路派生自冻结证据，不改写证据。<br>
+      持久会话断链后以 <b>Clean Start=0</b> 重连、CONNACK 回 <b>Session Present=1</b> 时，重传的 PUBREL/PUBLISH 跨连接衔接并沿用首次交付；Clean Start=1 清除与闭合后标识重用仅作旧链终止依据，不归入新首发。</div>
+    <div id="traceArea" style="display:none">
+      <div class="muted" style="margin-top:6px">可追溯首发（同一包标识多次首发并列，互不混淆）：</div>
+      <div class="origin-chips" id="originChips"></div>
+      <div id="chainEnd"></div>
+      <div class="plist">
+        <table>
+          <thead><tr><th class="seq">#</th><th>连接</th><th>类型</th><th>阶段变化</th><th>确认关系</th><th>唯一交付</th></tr></thead>
+          <tbody id="chainBody"></tbody>
+        </table>
+      </div>
+      <div id="boundaryBox"></div>
+    </div>
+  </section>
+</div>
+
+<div class="wrap" style="padding-top:0">
   <section class="card cases">
-    <h2>③ 已固化证据（点击按原输入回放）</h2>
+    <h2>④ 已固化证据（点击按原输入回放）</h2>
     <ul id="caseList"></ul>
   </section>
 </div>
@@ -151,6 +187,7 @@ const TYPES = ['CONNECT','CONNACK','PUBLISH','PUBREC','PUBREL','PUBCOMP','DISCON
 let packets = [];
 let lastVerdict = null;      // 当前展示的裁决
 let lastStatus = null;       // SEALED / REPLAYED / CONFLICT_REJECTED
+let lastAuditId = null;      // 当前裁决对应的审计标识（链路追溯真实接口用）
 let selectedSeq = null;
 
 const $ = (s)=>document.querySelector(s);
@@ -258,6 +295,16 @@ const PRESETS = {
     ['PUBLISH','C2S',{packetId:9,topic:'sat/z',payload:'z'}],
     ['PUBREC','S2C',{packetId:9}],['DISCONNECT','C2S',{reasonCode:142}]
   ],
+  reuse: [
+    // 旧首发在途未闭合 -> Clean Start=1 清除（旧链路终止）-> 同标识新首发独立闭合
+    ['CONNECT','C2S',{cleanStart:false}],['CONNACK','S2C',{}],
+    ['PUBLISH','C2S',{packetId:8,topic:'sat/a',payload:'old'}],
+    ['PUBREC','S2C',{packetId:8}],['DISCONNECT','C2S',{}],
+    ['CONNECT','C2S',{cleanStart:true}],['CONNACK','S2C',{}],
+    ['PUBLISH','C2S',{packetId:8,topic:'sat/a',payload:'new'}],
+    ['PUBREC','S2C',{packetId:8}],['PUBREL','C2S',{packetId:8}],['PUBCOMP','S2C',{packetId:8}],
+    ['DISCONNECT','C2S',{}]
+  ],
   direrr: [
     ['CONNECT','C2S',{cleanStart:true}],['CONNACK','S2C',{}],
     ['PUBLISH','S2C',{packetId:1,topic:'sat/e',payload:'e'}]
@@ -308,7 +355,8 @@ $('#reopenBtn').onclick = async ()=>{
 function handleResult(http,json){
   if(http===400){ toast('录入校验失败：\n'+(json.errors||[]).map(e=>'· '+e.message).join('\n'),'err'); return; }
   if(json.status==='CONFLICT_REJECTED'){
-    lastStatus='CONFLICT_REJECTED'; lastVerdict=null;
+    lastStatus='CONFLICT_REJECTED'; lastVerdict=null; lastAuditId=null;
+    $('#traceArea').style.display='none';
     renderConflict(json);
     toast('改动输入复用同一审计标识已被拒绝，原证据保留','err');
     loadCases();
@@ -316,7 +364,9 @@ function handleResult(http,json){
   }
   lastStatus = json.status;
   lastVerdict = json.record.evidence.verdict;
+  lastAuditId = json.record.auditId;
   renderVerdict(json.record, json.status, json.message);
+  loadTraceOrigins();
   loadCases();
   toast(json.message||'完成', json.record.evidence.verdict.verdict==='ACCEPTED'?'ok':'err');
 }
@@ -359,16 +409,26 @@ function renderVerdict(rec,status,message){
     const tr=document.createElement('tr');
     tr.className='pkt'+(p.violation?' violator':'');
     if(p.seq===v.reasonSeq) tr.classList.add('active');
+    if(p.traceableOrigin) tr.classList.add('origin');
     const dl = {FIRST:'<span class="badge ok">首次发布</span>', RESEND:'<span class="badge replay">合法重放</span>',
       DELIVERED_ONCE:'<span class="badge ok">交付一次</span>'}[p.firstDelivery]||'—';
-    tr.innerHTML=`<td class="seq">${p.seq}</td><td>${p.type}${p.dup?' <span class="badge warn">DUP</span>':''}</td>
-      <td>${p.direction}</td><td>${p.packetId??'—'}</td><td>${esc(p.phase)}</td><td>${dl}</td>`;
+    const originMark = p.traceableOrigin
+      ? `<button class="trace-btn" data-trace="${p.seq}" title="从该首发 PUBLISH 追溯完整交换链路">可追溯首发 → 链路</button>` : '';
+    tr.innerHTML=`<td class="seq">${p.seq}</td><td>${p.type}${p.dup?' <span class="badge warn">DUP</span>':''}${p.crossConnection?' <span class="badge warn">跨连接</span>':''}</td>
+      <td>${p.direction}</td><td>${p.packetId??'—'}</td><td>${esc(p.phase)}</td><td>${dl}<br>${originMark}</td>`;
     tr.onclick=()=>{ selectedSeq=p.seq; document.querySelectorAll('#evBody tr').forEach(x=>x.classList.remove('active')); tr.classList.add('active'); renderDetail(p,v); };
     eb.appendChild(tr);
   });
   const target = v.packets.find(p=>p.seq===v.reasonSeq) || v.packets[0];
   selectedSeq = target.seq;
   renderDetail(target,v);
+}
+
+function onTraceClick(e){
+  const b = e.target.closest && e.target.closest('[data-trace]');
+  if(!b) return;
+  e.stopPropagation();
+  loadTraceChain(Number(b.getAttribute('data-trace')));
 }
 
 function renderDetail(p,v){
@@ -385,6 +445,99 @@ function renderDetail(p,v){
     </dl>
     ${p.violation?`<div class="vbox"><b>首个违规依据（${esc(p.violation.code)}）</b><br>${esc(p.violation.detail)}</div>`:
       (v.verdict==='REJECTED'?'': '<div class="muted" style="margin-top:8px">本包未发现违规。</div>')}`;
+}
+
+// ---------- 首发链路追溯（经真实只读接口，派生自冻结证据） ----------
+const END_TEXT = {
+  CLOSED: '✅ 链路闭合：该首发遥测完成精确一次交付',
+  REJECTED: '⛔ 链路在拒绝包终止：存在违规，未完成交付',
+  TERMINATED_CLEAN_START: '⛔ 链路被 Clean Start=1 终止：在途交换状态被清除，旧确认不得归入新首发',
+  TERMINATED_SESSION_EXPIRED: '⛔ 链路因持久会话恢复失败终止：CS=0 重连却收到 Session Present=0，旧交换无状态可依',
+  CAPTURE_END_UNCLOSED: '⛔ 捕获结束仍未闭合：存在丢失的确认，未产生唯一交付',
+  CAPTURE_END: 'ℹ️ 捕获结束：链路未观察到闭合事件'
+};
+let traceOrigins = [];
+let activeOriginSeq = null;
+
+async function loadTraceOrigins(){
+  const area=$('#traceArea');
+  if(!lastAuditId){ area.style.display='none'; return; }
+  let j;
+  try{ j = await (await fetch('/api/audits/'+encodeURIComponent(lastAuditId)+'/trace-origins')).json(); }
+  catch(e){ toast('获取可追溯首发失败：'+e.message,'err'); return; }
+  if(!j.traceOrigins){ toast(j.message||'无可追溯首发','err'); area.style.display='none'; return; }
+  traceOrigins = j.traceOrigins;
+  area.style.display='block';
+  const box=$('#originChips'); box.innerHTML='';
+  traceOrigins.forEach(o=>{
+    const b=document.createElement('button');
+    const stTxt={CLOSED:'已闭合',REJECTED:'已拒绝',TERMINATED_CLEAN_START:'CleanStart终止',TERMINATED_SESSION_EXPIRED:'会话恢复失败终止',UNCLOSED:'未闭合'}[o.status]||o.status;
+    b.textContent=`首发 #${o.originSeq} · 标识 ${o.packetId} · 连接${o.connection} · ${stTxt}`;
+    b.dataset.origin=o.originSeq;
+    b.onclick=()=>loadTraceChain(o.originSeq);
+    box.appendChild(b);
+  });
+  $('#chainEnd').innerHTML=''; $('#chainBody').innerHTML=''; $('#boundaryBox').innerHTML='';
+  // 默认选第一个首发
+  if(traceOrigins.length) loadTraceChain(traceOrigins[0].originSeq);
+}
+
+async function loadTraceChain(originSeq){
+  if(!lastAuditId) return;
+  activeOriginSeq = originSeq;
+  document.querySelectorAll('#originChips button').forEach(b=>
+    b.classList.toggle('active', Number(b.dataset.origin)===originSeq));
+  let r, j;
+  try{
+    r = await fetch('/api/audits/'+encodeURIComponent(lastAuditId)+'/trace/'+encodeURIComponent(originSeq));
+    j = await r.json();
+  }catch(e){ toast('链路追溯请求失败：'+e.message,'err'); return; }
+  if(!r.ok){
+    $('#chainEnd').innerHTML = `<div class="chain-end REJECTED">查询被拒绝（${esc(j.code||'')}）：${esc(j.message||'')}</div>`;
+    $('#chainBody').innerHTML=''; $('#boundaryBox').innerHTML='';
+    toast(j.message||'链路查询无效','err');
+    return;
+  }
+  renderChain(j.chain);
+}
+
+function renderChain(c){
+  const endCls = ['REJECTED','CAPTURE_END_UNCLOSED','TERMINATED_CLEAN_START','TERMINATED_SESSION_EXPIRED','CAPTURE_END'].includes(c.endReason)
+    ? c.endReason : 'CLOSED';
+  $('#chainEnd').innerHTML = `<div class="chain-end ${endCls}">
+      ${END_TEXT[c.endReason]||c.endReason}（终止于第 ${c.endSeq} 包）
+      <div class="muted" style="color:inherit;opacity:.85;margin-top:3px">${esc(c.uniqueDelivery.note)}</div>
+    </div>`;
+  const tb=$('#chainBody'); tb.innerHTML='';
+  c.steps.forEach(s=>{
+    const tr=document.createElement('tr');
+    if(s.bridge) tr.className='step-bridge';
+    if(s.crossConnection) tr.classList.add('step-cross');
+    const ack = s.bridge
+      ? `<span class="muted">${esc(s.ackText||'')}</span>`
+      : `${esc(s.ackText||'—')}` +
+        (s.acknowledgesSeq?`<div class="muted">确认第 ${s.acknowledgesSeq} 包</div>`:'') +
+        (s.retransmitsSeq?`<div class="muted">重传第 ${s.retransmitsSeq} 包</div>`:'');
+    const deliv = s.deliveredOnce ? '<span class="badge ok">唯一交付</span>'
+      : (s.bridge?'—':(s.firstDelivery?{FIRST:'<span class="badge ok">首次发布</span>',RESEND:'<span class="badge replay">重放(不另计交付)</span>'}[s.firstDelivery]||'—':'—'));
+    const typeTxt = s.type + (s.packetId!=null?` <span class="muted">#${s.packetId}</span>`:'')
+      + (s.dup?' <span class="badge warn">DUP</span>':'')
+      + (s.crossConnection?' <span class="badge warn">跨连接</span>':'');
+    tr.innerHTML=`<td class="seq">${s.seq}</td>
+      <td>连接 ${s.connection}</td>
+      <td>${typeTxt}</td>
+      <td>${esc(s.phaseChange)}${s.crossRecovery?`<div class="muted" style="color:var(--warn)">↳ ${esc(s.crossRecovery)}</div>`:''}</td>
+      <td>${ack}</td>
+      <td>${deliv}</td>`;
+    tb.appendChild(tr);
+  });
+  const bb=$('#boundaryBox');
+  if(c.boundaryEvents && c.boundaryEvents.length){
+    bb.innerHTML=`<div class="boundbox"><b>链路边界（仅作前一链路终止依据，不并入本链路）：</b>
+      <ul style="margin:6px 0 0;padding-left:18px">
+      ${c.boundaryEvents.map(b=>`<li>第 ${b.seq} 包 ${b.type}（连接 ${b.connection}）— ${esc(b.detail||b.relation)}</li>`).join('')}
+      </ul></div>`;
+  } else bb.innerHTML='';
 }
 
 // ---------- 已固化案例 ----------
@@ -408,8 +561,9 @@ async function loadCases(){
           cleanStart:!!p.cleanStart,sessionPresent:!!p.sessionPresent,
           topic:p.topic??'',payload:p.payload??'',reasonCode:p.reasonCode??''}));
         renderRows();
-        lastStatus='REPLAYED'; lastVerdict=g.record.evidence.verdict;
+        lastStatus='REPLAYED'; lastVerdict=g.record.evidence.verdict; lastAuditId=g.record.auditId;
         renderVerdict(g.record,'REPLAYED','已从证据库回放原裁决');
+        loadTraceOrigins();
         toast('已从证据库回放该审计标识的原裁决','ok');
       }
     };
@@ -418,6 +572,7 @@ async function loadCases(){
 }
 
 // init
+$('#evBody').addEventListener('click', onTraceClick);
 packets.push(freshPacket());
 renderRows();
 loadCases();
