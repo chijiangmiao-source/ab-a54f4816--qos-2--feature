@@ -1,0 +1,41 @@
+services:
+  # 审计联调服务：页面 + API + 健康检查
+  app:
+    build: .
+    image: mqtt-qos2-relay-audit:latest
+    environment:
+      # 容器内固定监听 8080；宿主机端口通过 .env 的 HOST_PORT 配置（默认 8080）
+      PORT: "8080"
+      HOST: "0.0.0.0"
+      EVIDENCE_FILE: /app/data/evidence.jsonl
+    ports:
+      - "${HOST_PORT:-8080}:8080"
+    volumes:
+      - evidence-data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # 验证服务：围绕重连闭合规则运行引擎测试、证据库测试、页面构建检查，
+  # 并对 app 做 API/HTTP 冒烟（合法重发仅一次交付 / 冲突重发被拒绝）。
+  # 通过 `docker compose --profile verify run --rm verify` 触发，以退出码报告结果。
+  verify:
+    build: .
+    image: mqtt-qos2-relay-audit:latest
+    profiles: ["verify"]
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      # 冒烟指向 compose 网络内的 app 服务
+      BASE_URL: "http://app:8080"
+      EVIDENCE_FILE: /tmp/verify-engine/evidence.jsonl
+    entrypoint: ["sh", "-c", "export SMOKE_UID=verify-$$(date +%s); sh scripts/verify.sh"]
+    restart: "no"
+
+volumes:
+  evidence-data:

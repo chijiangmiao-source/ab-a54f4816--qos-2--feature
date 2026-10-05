@@ -1,0 +1,19 @@
+{
+  "name": "mqtt-qos2-relay-audit",
+  "version": "1.0.0",
+  "description": "星载遥测中继 MQTT 5 QoS 2 重发交付审计与未闭合会话裁决系统",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server/server.js",
+    "test": "node test/engine.test.js && node test/store.test.js",
+    "test:engine": "node test/engine.test.js",
+    "test:store": "node test/store.test.js",
+    "check-page": "node scripts/check-page.js",
+    "smoke": "node scripts/smoke.js",
+    "verify": "sh scripts/verify.sh"
+  }
+}

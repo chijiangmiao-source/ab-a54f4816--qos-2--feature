@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>星载遥测中继 MQTT 5 QoS2 重发交付审计</title>
+<style>
+  :root {
+    --bg:#0b1220; --panel:#111c30; --panel2:#0f1830; --line:#24334d;
+    --txt:#dce6f5; --muted:#8fa3c0; --ok:#34d399; --bad:#f87171; --warn:#fbbf24;
+    --accent:#60a5fa; --accent2:#2563eb;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.55 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+         background:var(--bg); color:var(--txt); }
+  header { padding:18px 24px; border-bottom:1px solid var(--line); background:linear-gradient(180deg,#101d34,#0b1220); }
+  header h1 { margin:0 0 4px; font-size:19px; }
+  header p { margin:0; color:var(--muted); font-size:13px; }
+  .wrap { display:grid; grid-template-columns:minmax(420px,1fr) minmax(420px,1fr); gap:16px; padding:16px 24px; }
+  @media (max-width:1000px){ .wrap{ grid-template-columns:1fr; } }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  .card h2 { margin:0 0 12px; font-size:15px; color:#bcd2f2; }
+  label { display:block; font-size:12px; color:var(--muted); margin:8px 0 4px; }
+  input,select { width:100%; background:var(--panel2); border:1px solid var(--line); color:var(--txt);
+          border-radius:6px; padding:7px 9px; font-size:13px; }
+  input:focus,select:focus{ outline:none; border-color:var(--accent); }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  th,td { border-bottom:1px solid var(--line); padding:5px 6px; text-align:left; white-space:nowrap; }
+  th { color:var(--muted); font-weight:600; position:sticky; top:0; background:var(--panel); }
+  td input,td select{ padding:4px 6px; font-size:12px; min-width:0; }
+  .seq { color:var(--muted); text-align:center; width:34px; }
+  .btns { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+  button { background:var(--accent2); color:#fff; border:0; border-radius:6px; padding:8px 14px;
+           font-size:13px; cursor:pointer; }
+  button.secondary{ background:#274063; }
+  button.danger{ background:#7f2d3a; }
+  button:hover{ filter:brightness(1.12); }
+  .presets button { background:#1d3355; font-size:12px; padding:6px 10px; }
+  .verdict { border-radius:10px; padding:14px 16px; margin-bottom:14px; border:1px solid; }
+  .verdict.ACCEPTED { background:rgba(52,211,153,.08); border-color:rgba(52,211,153,.45); }
+  .verdict.REJECTED { background:rgba(248,113,113,.08); border-color:rgba(248,113,113,.5); }
+  .verdict h3 { margin:0 0 4px; font-size:16px; }
+  .verdict.ACCEPTED h3{ color:var(--ok); } .verdict.REJECTED h3{ color:var(--bad); }
+  .verdict .meta{ color:var(--muted); font-size:12.5px; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11.5px; margin-left:6px; }
+  .badge.ok{ background:rgba(52,211,153,.15); color:var(--ok); }
+  .badge.bad{ background:rgba(248,113,113,.18); color:var(--bad); }
+  .badge.replay{ background:rgba(96,165,250,.18); color:var(--accent); }
+  .badge.warn{ background:rgba(251,191,36,.16); color:var(--warn); }
+  .plist { max-height:260px; overflow:auto; border:1px solid var(--line); border-radius:8px; }
+  .plist table{ cursor:pointer; }
+  tr.pkt:hover td{ background:#15243f; }
+  tr.pkt.active td{ background:#1b3155; }
+  tr.pkt.violator td{ background:rgba(248,113,113,.12); }
+  tr.pkt.violator td:first-child{ box-shadow:inset 3px 0 0 var(--bad); }
+  .detail { margin-top:12px; background:var(--panel2); border:1px solid var(--line); border-radius:8px; padding:12px 14px; min-height:120px; }
+  .detail dl{ display:grid; grid-template-columns:96px 1fr; gap:4px 10px; margin:0; }
+  .detail dt{ color:var(--muted); } .detail dd{ margin:0; }
+  .vbox{ margin-top:8px; padding:8px 10px; border-left:3px solid var(--bad); background:rgba(248,113,113,.08);
+         border-radius:4px; color:#fecaca; font-size:12.5px; white-space:pre-wrap; }
+  .cases li { list-style:none; padding:6px 8px; border-bottom:1px solid var(--line); cursor:pointer; display:flex; gap:8px; align-items:center; font-size:12.5px;}
+  .cases ul{ padding:0; margin:6px 0 0; max-height:220px; overflow:auto; }
+  .cases li:hover{ background:#15243f; }
+  .pill{ font-size:11px; padding:0 7px; border-radius:99px; }
+  .pill.ACCEPTED{ background:rgba(52,211,153,.15); color:var(--ok);}
+  .pill.REJECTED{ background:rgba(248,113,113,.18); color:var(--bad);}
+  .toast{ position:fixed; right:20px; bottom:20px; max-width:420px; background:#1b2c49; border:1px solid var(--line);
+          padding:12px 16px; border-radius:8px; box-shadow:0 8px 30px rgba(0,0,0,.45); display:none; font-size:13px;}
+  .toast.err{ border-color:rgba(248,113,113,.6); } .toast.ok{ border-color:rgba(52,211,153,.6); }
+  .muted{ color:var(--muted); font-size:12px; }
+  .flagbox{ display:flex; align-items:center; gap:6px; margin-top:8px; }
+  .flagbox input{ width:auto; }
+  .summary{ display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+  .summary span{ background:var(--panel2); border:1px solid var(--line); border-radius:6px; padding:2px 9px; font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>星载遥测中继 · MQTT 5 QoS 2 重发交付审计台</h1>
+  <p>审查断链重发后同一遥测是否<b>只交付一次</b>，并定位丢失确认造成的<b>未闭合会话</b>。仅处理 CONNECT / CONNACK / PUBLISH(QoS2) / PUBREC / PUBREL / PUBCOMP / DISCONNECT（≤48 包）。</p>
+</header>
+
+<div class="wrap">
+  <!-- ============ 录入 ============ -->
+  <section class="card">
+    <h2>① 捕获录入（按捕获顺序）</h2>
+    <div class="row">
+      <div><label>稳定审计标识 auditId</label><input id="auditId" placeholder="如 SAT-RELAY-20261004-01"></div>
+      <div><label>客户端标识 clientId</label><input id="clientId" placeholder="如 relay-sat-07"></div>
+    </div>
+
+    <div class="btns presets">
+      <span class="muted" style="align-self:center">场景模板：</span>
+      <button data-preset="normal">正常闭合</button>
+      <button data-preset="pubrecLost">PUBREC丢失·合法重放</button>
+      <button data-preset="pubcompLost">PUBCOMP丢失·重连恢复</button>
+      <button data-preset="double">闭合后重发(双投)</button>
+      <button data-preset="cleanstart">CleanStart后旧确认</button>
+      <button data-preset="payload">重发载荷冲突</button>
+      <button data-preset="unclosed">断链未闭合</button>
+      <button data-preset="direrr">方向错误</button>
+    </div>
+
+    <div class="plist" style="margin-top:10px">
+      <table>
+        <thead><tr><th class="seq">#</th><th style="width:104px">类型</th><th style="width:78px">方向</th>
+          <th style="width:80px">包标识</th><th style="width:150px">主题/载荷或标志</th><th></th></tr></thead>
+        <tbody id="pktBody"></tbody>
+      </table>
+    </div>
+    <div class="btns">
+      <button class="secondary" id="addBtn">＋ 添加控制包</button>
+      <span class="muted" id="countLabel" style="align-self:center"></span>
+    </div>
+    <div class="btns">
+      <button id="submitBtn">提交裁决并固化</button>
+      <button class="secondary" id="reopenBtn">按审计标识重新打开</button>
+      <button class="danger" id="clearBtn">清空录入</button>
+    </div>
+  </section>
+
+  <!-- ============ 裁决 ============ -->
+  <section class="card">
+    <h2>② 裁决证据（逐包查看）</h2>
+    <div id="verdictBox" class="muted">尚无裁决。录入捕获后点击“提交裁决并固化”。</div>
+    <div id="evidenceArea" style="display:none">
+      <div class="plist">
+        <table>
+          <thead><tr><th class="seq">#</th><th>类型</th><th>方向</th><th>包标识</th><th>会话阶段</th><th>首次交付</th></tr></thead>
+          <tbody id="evBody"></tbody>
+        </table>
+      </div>
+      <div class="detail" id="detailBox"></div>
+    </div>
+  </section>
+</div>
+
+<div class="wrap" style="padding-top:0">
+  <section class="card cases">
+    <h2>③ 已固化证据（点击按原输入回放）</h2>
+    <ul id="caseList"></ul>
+  </section>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const MAX = 48;
+const TYPES = ['CONNECT','CONNACK','PUBLISH','PUBREC','PUBREL','PUBCOMP','DISCONNECT'];
+let packets = [];
+let lastVerdict = null;      // 当前展示的裁决
+let lastStatus = null;       // SEALED / REPLAYED / CONFLICT_REJECTED
+let selectedSeq = null;
+
+const $ = (s)=>document.querySelector(s);
+const toast = (msg, kind='') => { const t=$('#toast'); t.textContent=msg; t.className='toast '+kind; t.style.display='block';
+  clearTimeout(t._h); t._h=setTimeout(()=>t.style.display='none', 5200); };
+
+function freshPacket(){ return { type:'CONNECT', direction:'C2S', packetId:'', dup:false,
+  cleanStart:false, sessionPresent:false, topic:'', payload:'', reasonCode:'' }; }
+
+// ---------- 录入表格 ----------
+function renderRows(){
+  const tb = $('#pktBody');
+  tb.innerHTML = '';
+  packets.forEach((p,i)=>{
+    const tr = document.createElement('tr');
+    tr.className = 'pkt';
+    const idBear = ['PUBLISH','PUBREC','PUBREL','PUBCOMP'].includes(p.type);
+    let extra = '';
+    if (p.type==='PUBLISH') extra = `<label style="margin:0">主题</label><input data-k="topic" value="${esc(p.topic)}" placeholder="telemetry/temp">
+        <label style="margin:2px 0 0">载荷</label><input data-k="payload" value="${esc(p.payload)}" placeholder='{"temp":12}'>`;
+    else if (p.type==='CONNECT') extra = `<div class="flagbox"><input type="checkbox" data-k="cleanStart" ${p.cleanStart?'checked':''}> Clean Start=1</div>`;
+    else if (p.type==='CONNACK') extra = `<div class="flagbox"><input type="checkbox" data-k="sessionPresent" ${p.sessionPresent?'checked':''}> Session Present=1</div>`;
+    else if (p.type==='DISCONNECT') extra = `<label style="margin:0">Reason Code(可选)</label><input data-k="reasonCode" value="${esc(p.reasonCode)}" placeholder="0">`;
+    tr.innerHTML = `
+      <td class="seq">${i+1}</td>
+      <td><select data-k="type">${TYPES.map(t=>`<option ${t===p.type?'selected':''}>${t}</option>`).join('')}</select></td>
+      <td><select data-k="direction"><option ${p.direction==='C2S'?'selected':''}>C2S</option><option ${p.direction==='S2C'?'selected':''}>S2C</option></select></td>
+      <td>${idBear?`<input data-k="packetId" value="${esc(p.packetId)}" placeholder="1..65535">`:''}</td>
+      <td>${p.type==='PUBLISH'?`<div class="flagbox" style="margin:0 0 4px"><input type="checkbox" data-k="dup" ${p.dup?'checked':''}> DUP=1</div>`:''}${extra}</td>
+      <td><button class="danger" data-del="${i}" style="padding:3px 8px">删</button></td>`;
+    tb.appendChild(tr);
+  });
+  $('#countLabel').textContent = `共 ${packets.length} / ${MAX} 包`;
+}
+
+$('#pktBody').addEventListener('input', onEdit);
+$('#pktBody').addEventListener('change', onEdit);
+$('#pktBody').addEventListener('click', (e)=>{
+  const del = e.target.getAttribute && e.target.getAttribute('data-del');
+  if (del!==null){ packets.splice(Number(del),1); renderRows(); }
+});
+function onEdit(e){
+  const tr = e.target.closest('tr'); if(!tr) return;
+  const idx = [...$('#pktBody').children].indexOf(tr);
+  const k = e.target.getAttribute('data-k'); if(!k) return;
+  let v;
+  if (e.target.type==='checkbox') v = e.target.checked;
+  else if (k==='type'){ v=e.target.value;
+    // 切换类型时给默认方向
+    packets[idx][k]=v;
+    packets[idx].direction = ['CONNACK','PUBREC','PUBCOMP'].includes(v)?'S2C':'C2S';
+    renderRows(); return;
+  } else v = e.target.value;
+  packets[idx][k]=v;
+  if (k==='type') renderRows();
+}
+$('#addBtn').onclick = ()=>{ if(packets.length>=MAX){toast(`最多 ${MAX} 包`,'err');return;} packets.push(freshPacket()); renderRows(); };
+$('#clearBtn').onclick = ()=>{ packets=[]; renderRows(); };
+const esc = (s)=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+// ---------- 场景模板 ----------
+const PRESETS = {
+  normal: [
+    ['CONNECT','C2S',{cleanStart:true}],['CONNACK','S2C',{sessionPresent:false}],
+    ['PUBLISH','C2S',{packetId:1,topic:'sat/temp',payload:'{"t":1}'}],
+    ['PUBREC','S2C',{packetId:1}],['PUBREL','C2S',{packetId:1}],['PUBCOMP','S2C',{packetId:1}],
+    ['DISCONNECT','C2S',{}]
+  ],
+  pubrecLost: [
+    ['CONNECT','C2S',{cleanStart:true}],['CONNACK','S2C',{sessionPresent:false}],
+    ['PUBLISH','C2S',{packetId:10,topic:'sat/temp',payload:'{"t":2}'}],
+    ['PUBLISH','C2S',{packetId:10,dup:true,topic:'sat/temp',payload:'{"t":2}'}],
+    ['PUBREC','S2C',{packetId:10}],['PUBREL','C2S',{packetId:10}],['PUBCOMP','S2C',{packetId:10}],
+    ['DISCONNECT','C2S',{}]
+  ],
+  pubcompLost: [
+    ['CONNECT','C2S',{cleanStart:false}],['CONNACK','S2C',{sessionPresent:false}],
+    ['PUBLISH','C2S',{packetId:22,topic:'sat/v',payload:'{"v":9}'}],
+    ['PUBREC','S2C',{packetId:22}],['PUBREL','C2S',{packetId:22}],
+    ['DISCONNECT','C2S',{reasonCode:142}],
+    ['CONNECT','C2S',{cleanStart:false}],['CONNACK','S2C',{sessionPresent:true}],
+    ['PUBREL','C2S',{packetId:22}],['PUBCOMP','S2C',{packetId:22}],
+    ['DISCONNECT','C2S',{}]
+  ],
+  double: [
+    ['CONNECT','C2S',{cleanStart:true}],['CONNACK','S2C',{}],
+    ['PUBLISH','C2S',{packetId:5,topic:'sat/x',payload:'1'}],
+    ['PUBREC','S2C',{packetId:5}],['PUBREL','C2S',{packetId:5}],['PUBCOMP','S2C',{packetId:5}],
+    ['PUBLISH','C2S',{packetId:5,dup:true,topic:'sat/x',payload:'1'}]
+  ],
+  cleanstart: [
+    ['CONNECT','C2S',{cleanStart:false}],['CONNACK','S2C',{}],
+    ['PUBLISH','C2S',{packetId:7,topic:'sat/y',payload:'p'}],
+    ['DISCONNECT','C2S',{}],
+    ['CONNECT','C2S',{cleanStart:true}],['CONNACK','S2C',{sessionPresent:false}],
+    ['PUBREL','C2S',{packetId:7}]
+  ],
+  payload: [
+    ['CONNECT','C2S',{cleanStart:true}],['CONNACK','S2C',{}],
+    ['PUBLISH','C2S',{packetId:3,topic:'sat/y',payload:'A'}],
+    ['PUBLISH','C2S',{packetId:3,dup:true,topic:'sat/y',payload:'B'}]
+  ],
+  unclosed: [
+    ['CONNECT','C2S',{cleanStart:false}],['CONNACK','S2C',{}],
+    ['PUBLISH','C2S',{packetId:9,topic:'sat/z',payload:'z'}],
+    ['PUBREC','S2C',{packetId:9}],['DISCONNECT','C2S',{reasonCode:142}]
+  ],
+  direrr: [
+    ['CONNECT','C2S',{cleanStart:true}],['CONNACK','S2C',{}],
+    ['PUBLISH','S2C',{packetId:1,topic:'sat/e',payload:'e'}]
+  ]
+};
+document.querySelectorAll('[data-preset]').forEach(b=>b.onclick=()=>{
+  packets = PRESETS[b.dataset.preset].map(([type,direction,o])=>({type,direction,packetId:o.packetId??'',
+    dup:!!o.dup, cleanStart:!!o.cleanStart, sessionPresent:!!o.sessionPresent,
+    topic:o.topic??'', payload:o.payload??'', reasonCode:o.reasonCode??''}));
+  renderRows();
+});
+
+// ---------- 构造请求 ----------
+function buildInput(){
+  return {
+    auditId: $('#auditId').value.trim(),
+    clientId: $('#clientId').value.trim(),
+    packets: packets.map(p=>({
+      type:p.type, direction:p.direction,
+      packetId:p.packetId===''?null:Number(p.packetId),
+      qos: p.type==='PUBLISH'?2:null,
+      dup:p.dup, cleanStart:p.cleanStart, sessionPresent:p.sessionPresent,
+      topic:p.topic||null, payload:p.payload||null,
+      reasonCode:p.reasonCode===''?null:Number(p.reasonCode)
+    }))
+  };
+}
+
+async function call(path, body){
+  const r = await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+  return { http:r.status, json:await r.json() };
+}
+
+$('#submitBtn').onclick = async ()=>{
+  try{
+    const {http,json} = await call('/api/audits', buildInput());
+    handleResult(http,json);
+  }catch(e){ toast('请求失败：'+e.message,'err'); }
+};
+$('#reopenBtn').onclick = async ()=>{
+  try{
+    const {http,json} = await call('/api/audits/reopen', buildInput());
+    if(http===404){ toast(json.message||'无此审计标识','err'); return; }
+    handleResult(http,json);
+  }catch(e){ toast('请求失败：'+e.message,'err'); }
+};
+
+function handleResult(http,json){
+  if(http===400){ toast('录入校验失败：\n'+(json.errors||[]).map(e=>'· '+e.message).join('\n'),'err'); return; }
+  if(json.status==='CONFLICT_REJECTED'){
+    lastStatus='CONFLICT_REJECTED'; lastVerdict=null;
+    renderConflict(json);
+    toast('改动输入复用同一审计标识已被拒绝，原证据保留','err');
+    loadCases();
+    return;
+  }
+  lastStatus = json.status;
+  lastVerdict = json.record.evidence.verdict;
+  renderVerdict(json.record, json.status, json.message);
+  loadCases();
+  toast(json.message||'完成', json.record.evidence.verdict.verdict==='ACCEPTED'?'ok':'err');
+}
+
+// ---------- 渲染裁决 ----------
+function renderConflict(c){
+  $('#evidenceArea').style.display='none';
+  $('#verdictBox').className='verdict REJECTED';
+  $('#verdictBox').innerHTML = `
+    <h3>⛔ 拒绝复用审计标识（EVIDENCE_CONFLICT）</h3>
+    <div class="meta">${esc(c.message)}</div>
+    <div style="margin-top:8px" class="meta">原裁决：<b>${esc(c.original.verdict)}</b> / ${esc(c.original.reason)}
+      （首个违规包序号 ${c.original.reasonSeq||0}）· 裁决编号 ${esc(c.original.caseId)} · 固化于 ${esc(c.original.sealedAt)}
+      · ${c.original.packetCount} 包</div>
+    <div class="muted" style="margin-top:6px;word-break:break-all">原指纹：${esc(c.original.fingerprint.slice(0,80))}…<br>本次指纹：${esc(c.attemptedFingerprint.slice(0,80))}…</div>`;
+}
+
+function renderVerdict(rec,status,message){
+  const v = rec.evidence.verdict;
+  $('#evidenceArea').style.display='block';
+  const acc = v.verdict==='ACCEPTED';
+  const statusBadge = status==='REPLAYED'
+    ? '<span class="badge replay">回放原裁决</span>'
+    : '<span class="badge ok">新固化</span>';
+  $('#verdictBox').className='verdict '+v.verdict;
+  $('#verdictBox').innerHTML = `
+    <h3>${acc?'✅ 裁决通过：同一遥测精确交付一次':'⛔ 裁决拒绝'}${statusBadge}</h3>
+    <div class="meta">${esc(v.reason)} —— ${esc(v.reasonText)}</div>
+    <div class="meta" style="margin-top:4px">首个违规依据定位于 <b>第 ${v.reasonSeq} 包</b>
+      · 裁决编号 ${esc(rec.caseId)} · 固化于 ${esc(rec.sealedAt)} · ${esc(message||'')}</div>
+    <div class="summary">
+      <span>连接次数 ${v.summary.connections}</span>
+      <span>精确交付 ${v.summary.deliveredOnce} 个遥测</span>
+      <span>已闭合标识 [${v.summary.closedPacketIds.join(', ')}]</span>
+      <span>未闭合标识 [${v.summary.openPacketIds.join(', ')}]</span>
+    </div>`;
+
+  const eb=$('#evBody'); eb.innerHTML='';
+  v.packets.forEach(p=>{
+    const tr=document.createElement('tr');
+    tr.className='pkt'+(p.violation?' violator':'');
+    if(p.seq===v.reasonSeq) tr.classList.add('active');
+    const dl = {FIRST:'<span class="badge ok">首次发布</span>', RESEND:'<span class="badge replay">合法重放</span>',
+      DELIVERED_ONCE:'<span class="badge ok">交付一次</span>'}[p.firstDelivery]||'—';
+    tr.innerHTML=`<td class="seq">${p.seq}</td><td>${p.type}${p.dup?' <span class="badge warn">DUP</span>':''}</td>
+      <td>${p.direction}</td><td>${p.packetId??'—'}</td><td>${esc(p.phase)}</td><td>${dl}</td>`;
+    tr.onclick=()=>{ selectedSeq=p.seq; document.querySelectorAll('#evBody tr').forEach(x=>x.classList.remove('active')); tr.classList.add('active'); renderDetail(p,v); };
+    eb.appendChild(tr);
+  });
+  const target = v.packets.find(p=>p.seq===v.reasonSeq) || v.packets[0];
+  selectedSeq = target.seq;
+  renderDetail(target,v);
+}
+
+function renderDetail(p,v){
+  const extra = [];
+  if(p.type==='CONNECT'){ /* flags shown in raw */ }
+  $('#detailBox').innerHTML = `
+    <dl>
+      <dt>包序号</dt><dd>第 ${p.seq} 包（第 ${p.connection} 条连接）</dd>
+      <dt>类型/方向</dt><dd>${p.type} / ${p.direction}${p.dup?' · DUP=1':''}</dd>
+      <dt>包标识</dt><dd>${p.packetId??'—'}</dd>
+      <dt>会话阶段</dt><dd>${esc(p.phase)}</dd>
+      <dt>首次交付状态</dt><dd>${ {FIRST:'首次发布（尚未交付应用）',RESEND:'断链重发（合法重放，Broker 去重，不重复交付）',DELIVERED_ONCE:'该遥测首次且唯一一次完成交付'}[p.firstDelivery]||'—' }</dd>
+      <dt>审计说明</dt><dd>${esc(p.note||'—')}</dd>
+    </dl>
+    ${p.violation?`<div class="vbox"><b>首个违规依据（${esc(p.violation.code)}）</b><br>${esc(p.violation.detail)}</div>`:
+      (v.verdict==='REJECTED'?'': '<div class="muted" style="margin-top:8px">本包未发现违规。</div>')}`;
+}
+
+// ---------- 已固化案例 ----------
+async function loadCases(){
+  const r = await fetch('/api/audits'); const j = await r.json();
+  const ul=$('#caseList'); ul.innerHTML='';
+  if(!j.audits.length){ ul.innerHTML='<li class="muted">暂无固化证据</li>'; return; }
+  j.audits.forEach(a=>{
+    const li=document.createElement('li');
+    li.innerHTML=`<span class="pill ${a.verdict}">${a.verdict==='ACCEPTED'?'通过':'拒绝'}</span>
+      <b style="flex:1">${esc(a.auditId)}</b><span class="muted">${esc(a.clientId)} · ${a.packetCount}包 · 违规#${a.reasonSeq}</span>`;
+    li.title='点击回填该审计标识并重新打开（需保持页面原输入一致以回放）';
+    li.onclick=async()=>{
+      $('#auditId').value=a.auditId;
+      const g = await (await fetch('/api/audits/'+encodeURIComponent(a.auditId))).json();
+      if(g.record){
+        $('#clientId').value=g.record.clientId;
+        // 用固化的规范化输入完整回填（主题/载荷/标志），保证按标识重开时指纹一致
+        packets = g.record.evidence.normalizedInput.packets.map(p=>({
+          type:p.type,direction:p.direction,packetId:p.packetId??'',dup:!!p.dup,
+          cleanStart:!!p.cleanStart,sessionPresent:!!p.sessionPresent,
+          topic:p.topic??'',payload:p.payload??'',reasonCode:p.reasonCode??''}));
+        renderRows();
+        lastStatus='REPLAYED'; lastVerdict=g.record.evidence.verdict;
+        renderVerdict(g.record,'REPLAYED','已从证据库回放原裁决');
+        toast('已从证据库回放该审计标识的原裁决','ok');
+      }
+    };
+    ul.appendChild(li);
+  });
+}
+
+// init
+packets.push(freshPacket());
+renderRows();
+loadCases();
+</script>
+</body>
+</html>
