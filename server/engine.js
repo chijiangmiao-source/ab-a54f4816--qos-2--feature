@@ -168,6 +168,7 @@ function createFlowState() {
   return {
     phase: 'INFLIGHT',
     bornConnection: 0,
+    originSeq: null, // 该流实例的首发 PUBLISH 序号（链路追溯原点）
     publishSeq: null,
     firstPublishSeq: null,
     resendSeqs: [],
@@ -180,7 +181,9 @@ function createFlowState() {
   };
 }
 
-export function adjudicate(rawInput) {
+// 追踪钩子（可选，第二参数）：裁决主循环在不改变任何裁决行为的前提下，
+// 向追踪器播报流创建/交换事件/Clean Start 清除/拒绝/未闭合，供 traceExchange 重建链路。
+export function adjudicate(rawInput, hooks = null) {
   const input = normalizeInput(rawInput);
   validateInput(input);
 
@@ -193,6 +196,8 @@ export function adjudicate(rawInput) {
     prevConnectionClean: null, // 上一条成功建立的连接是否 Clean Start
     flows: new Map(), // packetId -> flow（持久会话重连保留；Clean Start 清空）
     everDelivered: new Map(), // `${clientId}|${pid}` -> 首次 PUBCOMP 序号（跨连接、不清空）
+    deliveryOrigin: new Map(), // `${clientId}|${pid}` -> 完成该交付的首发序号
+    retiredByClean: new Map(), // pid -> { originSeq, connectSeq }：被 Clean Start 清除的流
     lastConnectSeq: 0
   };
 
@@ -211,6 +216,9 @@ export function adjudicate(rawInput) {
 
   const reject = (seq, code, detail) => {
     evidence[seq - 1].violation = { code, detail };
+    if (hooks && typeof hooks.onReject === 'function') {
+      hooks.onReject({ seq, code, detail, packet: input.packets[seq - 1], state: m });
+    }
     return {
       verdict: 'REJECTED',
       reason: code,
@@ -229,6 +237,13 @@ export function adjudicate(rawInput) {
       return reject(seq, 'PHASE_SKIP', `第 ${seq} 包出现在 CONNACK 之前：第 ${m.connection} 条连接尚未确认（阶段跳跃）`);
     }
     return null;
+  };
+
+  // 追溯钩子：把归属某流实例的报文序号播报给追踪器（不影响裁决）
+  const touchFlow = (seq, f) => {
+    if (hooks && typeof hooks.onFlowPacket === 'function') {
+      hooks.onFlowPacket({ seq, originSeq: f.originSeq });
+    }
   };
 
   for (const [i, p] of input.packets.entries()) {
@@ -257,6 +272,13 @@ export function adjudicate(rawInput) {
       if (p.cleanStart) {
         // Broker 侧旧会话状态被清除：在途流与发布记忆全部失效。
         // everDelivered 保留——它是审计侧"同一遥测曾经交付"的事实，用于拦截新会话双投。
+        for (const [pid, of] of m.flows) {
+          // 记录被清除的旧链路，供追溯：旧确认只能终止于该 CONNECT
+          m.retiredByClean.set(pid, { originSeq: of.originSeq, connectSeq: seq });
+          if (hooks && typeof hooks.onFlowRetired === 'function') {
+            hooks.onFlowRetired({ pid, originSeq: of.originSeq, connectSeq: seq });
+          }
+        }
         m.flows.clear();
       }
       continue;
@@ -330,6 +352,7 @@ export function adjudicate(rawInput) {
         }
         const nf = createFlowState();
         nf.bornConnection = m.connection;
+        nf.originSeq = seq;
         nf.firstPublishSeq = seq;
         nf.publishSeq = seq;
         nf.topic = p.topic;
@@ -338,6 +361,10 @@ export function adjudicate(rawInput) {
         e.phase = 'INFLIGHT';
         e.firstDelivery = 'FIRST';
         e.note = '首次发布：等待 PUBREC';
+        touchFlow(seq, nf);
+        if (hooks && typeof hooks.onOrigin === 'function') {
+          hooks.onOrigin({ seq, pid, connection: m.connection, packet: p });
+        }
         continue;
       }
 
@@ -369,6 +396,7 @@ export function adjudicate(rawInput) {
       e.phase = 'INFLIGHT';
       e.firstDelivery = 'RESEND';
       e.note = '合法重放：DUP=1 且载荷与首包一致，Broker 按包标识去重，不重复交付';
+      touchFlow(seq, f);
       continue;
     }
 
@@ -393,6 +421,7 @@ export function adjudicate(rawInput) {
           f.pubrecSeqs.push(seq);
           e.phase = 'REC_RCVD';
           e.note = '对 DUP 重发的 PUBREC 重放（合法重传确认）';
+          touchFlow(seq, f);
           continue;
         }
         return reject(seq, 'DUPLICATE_ACK',
@@ -403,6 +432,7 @@ export function adjudicate(rawInput) {
       f.pubrecPending = false;
       e.phase = 'REC_RCVD';
       e.note = 'Broker 已收齐遥测，等待中继发送 PUBREL';
+      touchFlow(seq, f);
       continue;
     }
 
@@ -425,6 +455,7 @@ export function adjudicate(rawInput) {
         f.pubrelSeqs.push(seq);
         e.phase = 'REL_SENT';
         e.note = 'PUBREL 重传：此前 PUBCOMP 丢失/未达，等待 Broker 重发 PUBCOMP';
+        touchFlow(seq, f);
         continue;
       }
       // INFLIGHT 直接到 PUBREL：捕获缺失 PUBREC。中继不应在未收 PUBREC 时发 PUBREL，
@@ -437,6 +468,7 @@ export function adjudicate(rawInput) {
       f.pubrelSeqs.push(seq);
       e.phase = 'REL_SENT';
       e.note = '中继请求释放报文副本，等待 PUBCOMP';
+      touchFlow(seq, f);
       continue;
     }
 
@@ -466,9 +498,14 @@ export function adjudicate(rawInput) {
       f.phase = 'CLOSED';
       f.pubcompSeq = seq;
       m.everDelivered.set(dkey, seq);
+      m.deliveryOrigin.set(dkey, f.originSeq);
       e.phase = 'CLOSED';
       e.firstDelivery = 'DELIVERED_ONCE';
       e.note = '精确一次交付完成：该遥测仅此一次交付给应用方';
+      touchFlow(seq, f);
+      if (hooks && typeof hooks.onClosed === 'function') {
+        hooks.onClosed({ seq, pid, originSeq: f.originSeq, connection: m.connection });
+      }
       continue;
     }
 
@@ -509,6 +546,9 @@ export function adjudicate(rawInput) {
         continue;
     }
     evidence[seq - 1].violation = { code: 'UNCLOSED_EXCHANGE', detail };
+    if (hooks && typeof hooks.onUnclosed === 'function') {
+      hooks.onUnclosed({ pid, originSeq: f.firstPublishSeq, phase: f.phase, seq });
+    }
     return {
       verdict: 'REJECTED',
       reason: 'UNCLOSED_EXCHANGE',
@@ -538,5 +578,389 @@ function buildSummary(m) {
     deliveredOnce: m.everDelivered.size,
     closedPacketIds: ids.filter((id) => m.flows.get(id).phase === 'CLOSED'),
     openPacketIds: ids.filter((id) => m.flows.get(id).phase !== 'CLOSED')
+  };
+}
+
+// ==================== 首发交换链路追溯（冻结证据只读重算） ====================
+//
+// 「首发」= 一个 QoS 2 流实例的第一条非 DUP PUBLISH（逐包证据 firstDelivery==='FIRST'）。
+// 持久会话重连（Clean Start=0 / CONNACK Session Present=1）沿用同一个流实例，跨连接的
+// PUBLISH(DUP=1) 重发、PUBREL 重传都挂在同一条首发链路下；Clean Start=1 清除流，
+// 此后同标识报文属于前一链路的终止边界，不得并入新的首发。
+//
+// 链路终点 termination.kind：
+//   CLOSED       正常闭合（PUBCOMP），首发产生唯一交付
+//   REJECTED     在归属该首发的报文上裁决拒绝（闭合后重用、清除后旧确认、载荷冲突等）
+//   CLEAN_START  在途流被后续 Clean Start=1 的 CONNECT 清除且其后无归属旧确认被拒
+//   CAPTURE_END  捕获结束仍未闭合（UNCLOSED_EXCHANGE 或裁决被其他包提前截断）
+//
+// 追溯对同一输入再跑一遍裁决（带采集钩子），只读、绝不固化或改写证据。
+
+export class TraceQueryError extends Error {
+  constructor(code, message, extra = {}) {
+    super(message);
+    this.name = 'TraceQueryError';
+    this.code = code;
+    Object.assign(this, extra);
+  }
+}
+
+const TRACE_ACK_RELATION = Object.freeze({
+  PUBLISH: 'PUBLISH→PUBREC（中继发布，等待 Broker 接收确认）',
+  PUBREC: 'PUBLISH→PUBREC（Broker 确认已收齐遥测）',
+  PUBREL: 'PUBREC→PUBREL（中继请求释放副本）',
+  PUBCOMP: 'PUBREL→PUBCOMP（Broker 完成释放，交付应用方）'
+});
+
+const BOUNDARY_TYPES = new Set(['CONNECT', 'CONNACK', 'DISCONNECT']);
+const ID_TYPES = new Set(['PUBLISH', 'PUBREC', 'PUBREL', 'PUBCOMP']);
+
+// 对输入再跑一遍裁决并采集追溯所需的中间事实
+function collectTraceFacts(normalized) {
+  const clientId = normalized.clientId;
+  const facts = {
+    verdict: null,
+    origins: new Map(),      // originSeq -> { pid, connection }
+    owner: new Map(),        // 报文序号 -> 所属首发序号（同一流实例）
+    closed: new Map(),       // originSeq -> { seq, pid }
+    retired: new Map(),      // originSeq -> { pid, connectSeq }
+    unclosed: null,          // { pid, originSeq, phase, seq }
+    reject: null             // { seq, pid, originSeq, deliveredOriginSeq, retiredOriginSeq, openOriginSeqs }
+  };
+
+  facts.verdict = adjudicate(normalized, {
+    onOrigin: ({ seq, pid, connection }) => facts.origins.set(seq, { pid, connection }),
+    onFlowPacket: ({ seq, originSeq }) => facts.owner.set(seq, originSeq),
+    onClosed: ({ seq, pid, originSeq }) => facts.closed.set(originSeq, { seq, pid }),
+    onFlowRetired: ({ pid, originSeq, connectSeq }) =>
+      facts.retired.set(originSeq, { pid, connectSeq }),
+    onUnclosed: (u) => { facts.unclosed = u; },
+    onReject: ({ seq, packet, state }) => {
+      const rec = { seq, pid: null, originSeq: null, deliveredOriginSeq: null, retiredOriginSeq: null, openOriginSeqs: [] };
+      for (const [fpid, f] of state.flows) {
+        if (f.phase !== 'CLOSED') rec.openOriginSeqs.push(f.originSeq);
+        void fpid;
+      }
+      if (packet && ID_TYPES.has(packet.type)) {
+        rec.pid = packet.packetId;
+        const f = state.flows.get(packet.packetId);
+        rec.originSeq = f ? f.originSeq : null;
+        const dkey = `${clientId}|${packet.packetId}`;
+        if (state.everDelivered.has(dkey)) rec.deliveredOriginSeq = state.deliveryOrigin.get(dkey);
+        const rt = state.retiredByClean.get(packet.packetId);
+        rec.retiredOriginSeq = rt ? rt.originSeq : null;
+      }
+      facts.reject = rec;
+    }
+  });
+  return facts;
+}
+
+// 列出全部可作为追溯原点的首发 PUBLISH（保持捕获顺序）
+export function traceableOrigins(rawInput) {
+  const normalized = normalizeInput(rawInput);
+  validateInput(normalized);
+  const verdict = adjudicate(normalized);
+  return verdict.packets
+    .filter((p) => p.type === 'PUBLISH' && p.firstDelivery === 'FIRST')
+    .map((p) => ({ seq: p.seq, packetId: p.packetId, connection: p.connection }));
+}
+
+// 从指定首发序号重建有序交换链路（纯函数、只读）
+export function traceExchange(rawInput, seqRaw) {
+  const normalized = normalizeInput(rawInput);
+  validateInput(normalized);
+  const total = normalized.packets.length;
+
+  const seq = Number(seqRaw);
+  if (!Number.isInteger(seq)) {
+    throw new TraceQueryError('SEQ_INVALID',
+      `首发序号必须为 1..${total} 的整数，实际为「${seqRaw}」`);
+  }
+  if (seq < 1 || seq > total) {
+    throw new TraceQueryError('SEQ_OUT_OF_RANGE',
+      `首发序号 ${seq} 越界：该审计共 ${total} 包，合法范围 1..${total}`,
+      { seq, packetCount: total });
+  }
+
+  const facts = collectTraceFacts(normalized);
+  const verdict = facts.verdict;
+  const originInfo = facts.origins.get(seq);
+
+  if (!originInfo) {
+    const pk = normalized.packets[seq - 1];
+    const ev = verdict.packets[seq - 1];
+    let reason;
+    if (pk.type !== 'PUBLISH') {
+      reason = `第 ${seq} 包是 ${pk.type} 而不是 PUBLISH：交换链路只能从首发 PUBLISH 开始追查`;
+    } else if (pk.dup) {
+      reason = `第 ${seq} 包是 DUP=1 的重发 PUBLISH（包标识 ${pk.packetId}），重发不是首发；请选择该标识本次会话最早的非 DUP PUBLISH 作为链路原点`;
+    } else if (ev.violation) {
+      reason = `第 ${seq} 包 PUBLISH（包标识 ${pk.packetId}）在建立流实例前即被判 ${ev.violation.code}，未形成可追溯的首发`;
+    } else {
+      reason = `第 ${seq} 包不构成可追溯的首发 PUBLISH`;
+    }
+    throw new TraceQueryError('NOT_AN_ORIGIN', reason, {
+      seq, packetType: pk.type, packetId: pk.packetId ?? null, dup: pk.dup
+    });
+  }
+
+  const pid = originInfo.pid;
+
+  // ---------- 终止点归属 ----------
+  // 全局拒绝是否归属本首发：
+  //   (a) 拒绝报文直接引用本 pid，且其流/已交付/被清除记录指向本首发；或
+  //   (b) 会话级拒绝（违规包无 packetId，如 SESSION_EXPIRED/SESSION_PRESENT_CONFLICT）
+  //       发生时本首发仍 open —— 链路被该拒绝截断。
+  const rj = facts.reject;
+  const rejectAttributed = !!(rj && rj.seq != null && rj.pid === pid &&
+    (rj.originSeq === seq || rj.deliveredOriginSeq === seq || rj.retiredOriginSeq === seq));
+  const rejectTruncates = !!(rj && rj.seq != null && !rejectAttributed &&
+    rj.openOriginSeqs.includes(seq) && rj.seq >= seq &&
+    !(facts.closed.has(seq)));
+  const closed = facts.closed.get(seq) || null;
+  const retired = facts.retired.get(seq) || null;
+
+  let endSeq;
+  let termination;
+  if (rejectAttributed || rejectTruncates) {
+    endSeq = rj.seq;
+    const violEv = verdict.packets[rj.seq - 1];
+    termination = {
+      kind: 'REJECTED',
+      seq: rj.seq,
+      code: verdict.reason,
+      reason: violEv.violation?.detail || verdict.reasonText
+    };
+  } else if (closed) {
+    endSeq = closed.seq;
+    termination = {
+      kind: 'CLOSED',
+      seq: closed.seq,
+      code: null,
+      reason: `第 ${closed.seq} 包 PUBCOMP 闭合：包标识 ${pid} 的首发遥测完成唯一一次应用交付`
+    };
+  } else if (retired) {
+    endSeq = retired.connectSeq;
+    termination = {
+      kind: 'CLEAN_START',
+      seq: retired.connectSeq,
+      code: null,
+      reason: `第 ${retired.connectSeq} 包 CONNECT 以 Clean Start=1 建立全新会话，包标识 ${pid} 的旧会话状态被清除；旧链路到此终止，之后同标识报文不得并入本首发`
+    };
+  } else {
+    endSeq = total;
+    const u = facts.unclosed && facts.unclosed.originSeq === seq ? facts.unclosed : null;
+    termination = {
+      kind: 'CAPTURE_END',
+      seq: null,
+      code: u ? 'UNCLOSED_EXCHANGE' : null,
+      reason: u
+        ? `捕获结束时包标识 ${pid} 停留在 ${u.phase}：存在丢失的确认，交换未闭合`
+        : `捕获结束（第 ${total} 包）时包标识 ${pid} 的交换未走完（裁决可能已被其他包提前终止）`
+    };
+  }
+
+  // ---------- 链路成员：归属本首发的标识报文 + 区间内连接边界包 ----------
+  const memberSeqs = [];
+  for (let s = seq; s <= endSeq; s++) {
+    const pk = normalized.packets[s - 1];
+    if (ID_TYPES.has(pk.type)) {
+      if (facts.owner.get(s) === seq) memberSeqs.push(s);
+    } else if (BOUNDARY_TYPES.has(pk.type)) {
+      memberSeqs.push(s);
+    }
+  }
+  // 被归属的拒绝报文本身（可能尚未建流，owner 中无记录）
+  if (rejectAttributed && !memberSeqs.includes(rj.seq)) memberSeqs.push(rj.seq);
+  memberSeqs.sort((a, b) => a - b);
+
+  // ---------- 逐项组装 ----------
+  const steps = memberSeqs.map((s, idx) => {
+    const pk = normalized.packets[s - 1];
+    const ev = verdict.packets[s - 1];
+    const isTerminalViolation = (rejectAttributed || rejectTruncates) && s === rj.seq;
+    const step = {
+      order: idx + 1,
+      seq: s,
+      connection: ev.connection,
+      type: pk.type,
+      direction: pk.direction,
+      packetId: pk.packetId,
+      dup: pk.dup,
+      phase: ev.phase,
+      role: null,
+      ackRelation: null,
+      acknowledges: null,
+      deliveryEffect: null,
+      note: ev.note || '',
+      violation: isTerminalViolation ? (ev.violation || {
+        code: verdict.reason, detail: termination.reason
+      }) : null
+    };
+
+    if (BOUNDARY_TYPES.has(pk.type)) {
+      step.role = 'SESSION_BOUNDARY';
+      step.ackRelation = null;
+      if (pk.type === 'CONNECT') {
+        step.note = pk.cleanStart
+          ? 'Clean Start=1：Broker 清除旧会话状态（旧链路终止边界）'
+          : 'Clean Start=0：请求恢复持久会话';
+      } else if (pk.type === 'CONNACK') {
+        step.note = pk.sessionPresent
+          ? 'Session Present=1：持久会话恢复成功，在途交换跨连接沿用同一首发交付'
+          : 'Session Present=0：无既有会话状态';
+      }
+      return step;
+    }
+
+    step.ackRelation = TRACE_ACK_RELATION[pk.type];
+    if (pk.type === 'PUBLISH') {
+      if (s === seq) {
+        step.role = 'FIRST_PUBLISH';
+        step.deliveryEffect = 'FIRST_DELIVERY_CANDIDATE';
+      } else if (ev.firstDelivery === 'RESEND') {
+        // 引擎认可的合法重放（DUP=1、载荷一致、Broker 去重）
+        step.role = 'RESEND';
+        step.deliveryEffect = 'DEDUPED_RESEND';
+      } else {
+        // 闭合后重发 / 清除后重用：未被认可为重放，终止前的二次交付尝试
+        step.role = 'REUSE_AFTER_TERMINATION';
+        step.deliveryEffect = 'REJECTED_BEFORE_DELIVERY';
+      }
+    } else if (pk.type === 'PUBREC') {
+      step.role = 'ACK';
+    } else if (pk.type === 'PUBREL') {
+      step.role = 'RELAY';
+    } else if (pk.type === 'PUBCOMP') {
+      step.role = 'COMPLETE';
+      if (closed && s === closed.seq) step.deliveryEffect = 'UNIQUE_DELIVERY';
+    }
+    return step;
+  });
+
+  // 确认/重传关系：应答最近的对应前序包；PUBREL 重传指向前一 PUBREL
+  const lastByType = {};
+  for (const st of steps) {
+    if (st.role === 'SESSION_BOUNDARY') continue;
+    if (st.type === 'PUBLISH') {
+      if (st.role === 'RESEND' || st.role === 'REUSE_AFTER_TERMINATION') {
+        st.acknowledges = lastByType.PUBLISH ?? seq;
+      }
+      lastByType.PUBLISH = st.seq;
+    } else if (st.type === 'PUBREC') {
+      st.acknowledges = lastByType.PUBLISH ?? seq;
+      lastByType.PUBREC = st.seq;
+    } else if (st.type === 'PUBREL') {
+      st.acknowledges = lastByType.PUBREL ?? lastByType.PUBREC ?? null;
+      lastByType.PUBREL = st.seq;
+    } else if (st.type === 'PUBCOMP') {
+      st.acknowledges = lastByType.PUBREL ?? null;
+      lastByType.PUBCOMP = st.seq;
+    }
+  }
+
+  // ---------- 连接跨度与跨连接恢复说明 ----------
+  const connFlags = new Map(); // connection -> { cleanStart, sessionPresent, connectSeq, connackSeq }
+  let curConn = 0;
+  normalized.packets.forEach((pk, i) => {
+    const ev = verdict.packets[i];
+    if (pk.type === 'CONNECT') {
+      curConn = ev.connection;
+      connFlags.set(curConn, { cleanStart: pk.cleanStart, sessionPresent: null, connectSeq: ev.seq, connackSeq: null });
+    } else if (pk.type === 'CONNACK') {
+      const f = connFlags.get(ev.connection);
+      if (f) { f.sessionPresent = pk.sessionPresent; f.connackSeq = ev.seq; }
+    }
+  });
+
+  const connSeqs = new Map();
+  for (const st of steps) {
+    if (st.role === 'SESSION_BOUNDARY') continue;
+    if (!connSeqs.has(st.connection)) connSeqs.set(st.connection, []);
+    connSeqs.get(st.connection).push(st);
+  }
+  const connectionSpans = [...connSeqs.entries()].map(([connection, ss]) => {
+    const f = connFlags.get(connection) || {};
+    return {
+      connection,
+      fromSeq: ss[0].seq,
+      toSeq: ss[ss.length - 1].seq,
+      cleanStart: f.cleanStart ?? null,
+      sessionPresent: f.sessionPresent ?? null,
+      connectSeq: f.connectSeq ?? null,
+      connackSeq: f.connackSeq ?? null,
+      resumed: f.cleanStart === false && f.sessionPresent === true
+    };
+  });
+
+  const crossConnection = connectionSpans.length > 1;
+  const recovery = connectionSpans.slice(1).map((span) => ({
+    connection: span.connection,
+    connectSeq: span.connectSeq,
+    connackSeq: span.connackSeq,
+    cleanStart: span.cleanStart,
+    sessionPresent: span.sessionPresent,
+    resumed: span.resumed,
+    continuesFirstDeliverySeq: seq,
+    retransmitted: steps
+      .filter((s) => s.connection === span.connection &&
+        (s.type === 'PUBREL' || (s.type === 'PUBLISH' && s.dup)))
+      .map((s) => ({ seq: s.seq, type: s.type, role: s.role })),
+    note: span.resumed
+      ? `第 ${span.connection} 条连接以 Clean Start=0 恢复、CONNACK(第 ${span.connackSeq} 包) Session Present=1：包标识 ${pid} 沿用第 ${seq} 包首发的同一交付，跨连接重传 PUBREL/PUBLISH 不产生新交付`
+      : `第 ${span.connection} 条连接（Clean Start=${span.cleanStart === null ? '—' : (span.cleanStart ? 1 : 0)}, Session Present=${span.sessionPresent === null ? '—' : (span.sessionPresent ? 1 : 0)}）`
+  }));
+
+  // ---------- 未并入链路的同标识报文（审查核对依据） ----------
+  const included = new Set(memberSeqs);
+  const excludedSameIdPackets = [];
+  for (let s = 1; s <= total; s++) {
+    const pk = normalized.packets[s - 1];
+    if (!ID_TYPES.has(pk.type) || pk.packetId !== pid || included.has(s)) continue;
+    let reason;
+    if (s < seq) {
+      reason = '早于本首发：属于更早的（已清除）流实例，不并入本链路';
+    } else if (facts.owner.get(s) && facts.owner.get(s) !== seq) {
+      reason = '属于 Clean Start 后新会话对同一包标识的另一首发链路，与本首发互不混淆';
+    } else if (termination.kind === 'CLEAN_START') {
+      reason = '晚于 Clean Start 清除边界：清除会话后继续旧确认/重发，只作为前一链路的终止依据，不属新首发';
+    } else if (closed && s > closed.seq) {
+      reason = '晚于闭合序号：闭合后重用同一包标识，作为前一链路的终止/违规依据，不构成新首发链路内容';
+    } else if (s > endSeq) {
+      reason = '晚于本链路终止点，不并入本首发';
+    } else {
+      reason = '不属于本首发流实例';
+    }
+    excludedSameIdPackets.push({
+      seq: s, type: pk.type, connection: verdict.packets[s - 1].connection,
+      dup: pk.dup, reason
+    });
+  }
+
+  const deliveredOnce = !!closed;
+  return {
+    auditId: normalized.auditId,
+    clientId: normalized.clientId,
+    packetId: pid,
+    origin: { seq, packetId: pid, connection: originInfo.connection },
+    termination,
+    deliveredOnce,
+    uniqueDelivery: closed
+      ? { packetId: pid, originSeq: seq, pubcompSeq: closed.seq }
+      : null,
+    unclosed: termination.kind === 'CAPTURE_END' && !!termination.code,
+    steps,
+    connectionSpans,
+    crossConnection,
+    recovery,
+    excludedSameIdPackets,
+    verdict: {
+      verdict: verdict.verdict,
+      reason: verdict.reason,
+      reasonText: verdict.reasonText,
+      reasonSeq: verdict.reasonSeq
+    },
+    packetCount: total
   };
 }

@@ -188,7 +188,7 @@ try {
   const r9 = await api('/api/audits', bad);
   check('非法录入返回 400 与字段错误', r9.status === 400 && Array.isArray(r9.json.errors));
 
-  // 12. 案例列表包含本轮 6 条固化记录（verify 可重复运行）
+  // 12. 案例列表包含本轮 6 条固化记录（第 14 项起的链路追溯用例在其后才固化）
   const list = await (await fetch(base + '/api/audits')).json();
   const mine = list.audits.filter((a) => a.auditId.endsWith('-' + RUN));
   check('证据列表包含本轮 6 条固化记录', mine.length === 6, `实际 ${mine.length}`);
@@ -197,6 +197,119 @@ try {
   const one = await (await fetch(base + '/api/audits/' + encodeURIComponent(uid('SMOKE-LEGAL-ONCE')))).json();
   check('原证据保留: 合法重发案例仍 ACCEPTED',
     one.record.evidence.verdict.verdict === 'ACCEPTED');
+
+  // ==================== 首发交换链路追溯（经真实 HTTP，只读） ====================
+  const getJson = async (pathname) => {
+    const r = await fetch(base + pathname);
+    return { status: r.status, json: await r.json() };
+  };
+  const traceUrl = (id, seq) => '/api/audits/' + encodeURIComponent(id) + '/trace?seq=' + seq;
+  const idOnly = (t) => t.steps.filter((s) => s.role !== 'SESSION_BOUNDARY').map((s) => s.seq);
+
+  // 14. 正常闭合链路
+  const tNormal = {
+    auditId: uid('SMOKE-TRACE-NORMAL'), clientId: 'c',
+    packets: [C(true), CA(false), P(11), REC(11), REL(11), COMP(11), DISC()]
+  };
+  await api('/api/audits', tNormal);
+  const o1 = await getJson('/api/audits/' + encodeURIComponent(tNormal.auditId) + '/trace/origins');
+  check('追溯: origins 接口 200 且列首发@3', o1.status === 200 &&
+    Array.isArray(o1.json.origins) && o1.json.origins[0].seq === 3 && o1.json.origins[0].packetId === 11);
+  const g1 = await getJson(traceUrl(tNormal.auditId, 3));
+  check('追溯: 正常闭合 200 TRACED', g1.status === 200 && g1.json.status === 'TRACED');
+  const tr1 = g1.json.trace;
+  check('追溯: 正常闭合 CLOSED@6 唯一交付',
+    tr1.termination.kind === 'CLOSED' && tr1.termination.seq === 6 && tr1.deliveredOnce === true &&
+    tr1.uniqueDelivery.pubcompSeq === 6);
+  check('追溯: 逐项原始序号 [3,4,5,6]', JSON.stringify(idOnly(tr1)) === '[3,4,5,6]');
+  check('追溯: 逐项连接编号均为 1', tr1.steps.every((s) => s.connection === 1));
+  check('追溯: 阶段变化 INFLIGHT→REC_RCVD→REL_SENT→CLOSED',
+    JSON.stringify(tr1.steps.filter((s) => s.role !== 'SESSION_BOUNDARY').map((s) => s.phase))
+      === '["INFLIGHT","REC_RCVD","REL_SENT","CLOSED"]');
+  check('追溯: 确认关系 PUBREL 应答 PUBREC@4 / PUBCOMP 应答 PUBREL@5',
+    tr1.steps.find((s) => s.seq === 5).acknowledges === 4 &&
+    tr1.steps.find((s) => s.seq === 6).acknowledges === 5);
+
+  // 15. 跨重连恢复链路（PUBCOMP 丢失，CS=0/SP=1，重传 PUBREL）
+  const tRecover = {
+    auditId: uid('SMOKE-TRACE-RECOVER'), clientId: 'c',
+    packets: [C(false), CA(false), P(33), REC(33), REL(33), DISC(142),
+      C(false), CA(true), REL(33), COMP(33), DISC()]
+  };
+  await api('/api/audits', tRecover);
+  const g2 = await getJson(traceUrl(tRecover.auditId, 3));
+  const tr2 = g2.json.trace;
+  check('追溯: 重连恢复 CLOSED@10 且唯一交付',
+    g2.status === 200 && tr2.termination.kind === 'CLOSED' &&
+    tr2.termination.seq === 10 && tr2.deliveredOnce === true);
+  check('追溯: 跨连接衔接序号 [3,4,5,9,10]', JSON.stringify(idOnly(tr2)) === '[3,4,5,9,10]');
+  check('追溯: PUBREL@9 属第 2 条连接且 ack 前一 PUBREL@5',
+    tr2.steps.find((s) => s.seq === 9).connection === 2 &&
+    tr2.steps.find((s) => s.seq === 9).acknowledges === 5);
+  check('追溯: 恢复段 CS=0/SP=1 沿用首发@3',
+    tr2.crossConnection === true && tr2.recovery.length === 1 &&
+    tr2.recovery[0].resumed === true && tr2.recovery[0].cleanStart === false &&
+    tr2.recovery[0].sessionPresent === true && tr2.recovery[0].continuesFirstDeliverySeq === 3);
+  check('追溯: 恢复说明声明沿用首次交付且不产生新交付',
+    /沿用第 3 包首发的同一交付/.test(tr2.recovery[0].note));
+
+  // 16. 标识复用边界：闭合后 DUP 重用，链路终止于拒绝
+  const tReuse = {
+    auditId: uid('SMOKE-TRACE-REUSE'), clientId: 'c',
+    packets: [C(true), CA(false), P(44), REC(44), REL(44), COMP(44), P(44, { dup: true })]
+  };
+  await api('/api/audits', tReuse);
+  const g3 = await getJson(traceUrl(tReuse.auditId, 3));
+  const tr3 = g3.json.trace;
+  check('追溯: 闭合后重用终止 REJECTED@7/DOUBLE_DELIVERY',
+    tr3.termination.kind === 'REJECTED' && tr3.termination.seq === 7 &&
+    tr3.termination.code === 'DOUBLE_DELIVERY');
+  check('追溯: 首发唯一交付仍成立(PUBCOMP@6)', tr3.deliveredOnce === true);
+  check('追溯: 重用包不被当作合法重放',
+    tr3.steps.find((s) => s.seq === 7).role === 'REUSE_AFTER_TERMINATION' &&
+    tr3.steps.find((s) => s.seq === 7).violation.code === 'DOUBLE_DELIVERY');
+
+  // 17. 同标识两次不同首发（未交付被 Clean Start 清除，新会话复用）互不混淆
+  const tMulti = {
+    auditId: uid('SMOKE-TRACE-MULTI'), clientId: 'c',
+    packets: [C(false), CA(false), P(55), DISC(), C(true), CA(false),
+      P(55), REC(55), REL(55), COMP(55), DISC()]
+  };
+  await api('/api/audits', tMulti);
+  const o4 = await getJson('/api/audits/' + encodeURIComponent(tMulti.auditId) + '/trace/origins');
+  check('追溯: 同标识列两个首发 @3/@7', o4.status === 200 &&
+    o4.json.origins.length === 2 && o4.json.origins.every((x) => x.packetId === 55) &&
+    o4.json.origins[0].seq === 3 && o4.json.origins[1].seq === 7);
+  const g4a = await getJson(traceUrl(tMulti.auditId, 3));
+  const g4b = await getJson(traceUrl(tMulti.auditId, 7));
+  check('追溯: 首发@3 链路终止 CLEAN_START@5 无交付',
+    g4a.json.trace.termination.kind === 'CLEAN_START' &&
+    g4a.json.trace.termination.seq === 5 && g4a.json.trace.deliveredOnce === false);
+  check('追溯: 首发@7 链路 CLOSED@10 唯一交付',
+    g4b.json.trace.termination.kind === 'CLOSED' &&
+    g4b.json.trace.termination.seq === 10 && g4b.json.trace.deliveredOnce === true);
+  const sa = new Set(idOnly(g4a.json.trace)); const sb = new Set(idOnly(g4b.json.trace));
+  check('追溯: 两条链路标识报文互不相交', [...sa].every((x) => !sb.has(x)));
+  check('追溯: 首发@3 排除新首发报文(7..10)',
+    JSON.stringify(g4a.json.trace.excludedSameIdPackets.map((e) => e.seq)) === '[7,8,9,10]');
+  check('追溯: 首发@7 排除旧首发@3',
+    JSON.stringify(g4b.json.trace.excludedSameIdPackets.map((e) => e.seq)) === '[3]');
+
+  // 18. 错误查询：未知审计 / 越界 / 非首发 / 缺 seq —— 且冻结证据不被改写
+  const recordsBefore = (await (await fetch(base + '/health')).json()).records;
+  const e1 = await getJson('/api/audits/' + encodeURIComponent(uid('NO-SUCH-AUDIT')) + '/trace?seq=1');
+  check('追溯: 未知审计 404', e1.status === 404 && e1.json.code === 'AUDIT_ID_NOT_FOUND');
+  const e2 = await getJson(traceUrl(tNormal.auditId, 999));
+  check('追溯: 越界序号 400 SEQ_OUT_OF_RANGE', e2.status === 400 && e2.json.code === 'SEQ_OUT_OF_RANGE');
+  const e3 = await getJson(traceUrl(tNormal.auditId, 4)); // 第 4 包是 PUBREC
+  check('追溯: 非首发(PUBREC) 422 NOT_AN_ORIGIN', e3.status === 422 && e3.json.code === 'NOT_AN_ORIGIN');
+  const e4 = await getJson('/api/audits/' + encodeURIComponent(tNormal.auditId) + '/trace');
+  check('追溯: 缺 seq 422 SEQ_REQUIRED', e4.status === 422 && e4.json.code === 'SEQ_REQUIRED');
+  const e5 = await getJson(traceUrl(tReuse.auditId, 7)); // 闭合后重用包
+  check('追溯: 重用包不能作为首发 422', e5.status === 422 && e5.json.code === 'NOT_AN_ORIGIN');
+  const recordsAfter = (await (await fetch(base + '/health')).json()).records;
+  check('追溯: 只读不改写冻结证据(记录数不变)', recordsBefore === recordsAfter,
+    `${recordsBefore} -> ${recordsAfter}`);
 } catch (e) {
   check('冒烟执行无异常: ' + e.message, false, e.stack);
 } finally {

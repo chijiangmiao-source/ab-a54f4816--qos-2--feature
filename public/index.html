@@ -73,6 +73,35 @@
   .flagbox input{ width:auto; }
   .summary{ display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
   .summary span{ background:var(--panel2); border:1px solid var(--line); border-radius:6px; padding:2px 9px; font-size:12px; }
+  .tracebtn{ background:#14532d; color:#d1fae5; border:1px solid #166534; border-radius:5px; padding:1px 7px;
+             font-size:11px; cursor:pointer; margin-left:6px; }
+  .tracebtn:hover{ filter:brightness(1.25); }
+  tr.pkt.activeTrace td{ background:#143524; }
+  .chain-head{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:10px; }
+  .chain-head select{ width:auto; min-width:230px; }
+  .term{ display:inline-block; padding:2px 10px; border-radius:999px; font-size:12px; }
+  .term.CLOSED{ background:rgba(52,211,153,.15); color:var(--ok); }
+  .term.REJECTED{ background:rgba(248,113,113,.18); color:var(--bad); }
+  .term.CLEAN_START{ background:rgba(251,191,36,.16); color:var(--warn); }
+  .term.CAPTURE_END{ background:rgba(143,163,192,.18); color:var(--muted); }
+  .chain table td.conn{ text-align:center; color:var(--accent); font-weight:600; }
+  .chain tr.boundary td{ color:var(--warn); background:rgba(251,191,36,.05); font-style:italic; }
+  .chain tr.terminal td{ box-shadow:inset 3px 0 0 var(--bad); }
+  .role-tag{ font-size:11px; padding:0 6px; border-radius:5px; white-space:nowrap; }
+  .role-FIRST_PUBLISH{ background:rgba(52,211,153,.16); color:var(--ok); }
+  .role-RESEND{ background:rgba(96,165,250,.18); color:var(--accent); }
+  .role-REUSE_AFTER_TERMINATION{ background:rgba(248,113,113,.18); color:var(--bad); }
+  .role-ACK,.role-RELAY,.role-COMPLETE{ background:#1d3355; color:#bcd2f2; }
+  .role-SESSION_BOUNDARY{ background:rgba(251,191,36,.14); color:var(--warn); }
+  .eff{ font-size:11px; color:var(--muted); white-space:nowrap; }
+  .eff.UNIQUE_DELIVERY{ color:var(--ok); font-weight:600; }
+  .eff.DEDUPED_RESEND{ color:var(--accent); }
+  .eff.REJECTED_BEFORE_DELIVERY{ color:var(--bad); }
+  .note-box{ margin-top:10px; border:1px solid var(--line); border-radius:8px; padding:10px 12px; background:var(--panel2); }
+  .note-box h4{ margin:0 0 6px; font-size:12.5px; color:#bcd2f2; }
+  .note-box li{ margin:3px 0; font-size:12px; }
+  .recov{ border-left:3px solid var(--accent); }
+  .excl{ border-left:3px solid var(--warn); }
 </style>
 </head>
 <body>
@@ -137,8 +166,32 @@
 </div>
 
 <div class="wrap" style="padding-top:0">
+  <section class="card chain">
+    <h2>③ 首发交换链路追查（从某条首发 PUBLISH 到闭合 / 拒绝 / 捕获结束）</h2>
+    <div id="chainHint" class="muted">在上方逐包证据中，点击标记为「首次发布」的行并使用“追查此首发链路”，或在此选择可追溯首发。链路仅对冻结证据只读重算，不改写证据。</div>
+    <div id="chainArea" style="display:none">
+      <div class="chain-head">
+        <label style="margin:0">可追溯首发</label>
+        <select id="originSelect"></select>
+        <button id="traceBtn">追查链路</button>
+        <span id="chainTerm"></span>
+      </div>
+      <div class="plist" style="max-height:320px">
+        <table>
+          <thead><tr><th class="seq">链序</th><th class="seq">原始序号</th><th style="width:54px">连接</th>
+            <th>类型</th><th>方向</th><th>包标识</th><th>阶段变化</th><th>环节</th><th>确认/重传关系</th><th>交付效果</th></tr></thead>
+          <tbody id="chainBody"></tbody>
+        </table>
+      </div>
+      <div id="chainRecov"></div>
+      <div id="chainExcl"></div>
+    </div>
+  </section>
+</div>
+
+<div class="wrap" style="padding-top:0">
   <section class="card cases">
-    <h2>③ 已固化证据（点击按原输入回放）</h2>
+    <h2>④ 已固化证据（点击按原输入回放）</h2>
     <ul id="caseList"></ul>
   </section>
 </div>
@@ -151,7 +204,9 @@ const TYPES = ['CONNECT','CONNACK','PUBLISH','PUBREC','PUBREL','PUBCOMP','DISCON
 let packets = [];
 let lastVerdict = null;      // 当前展示的裁决
 let lastStatus = null;       // SEALED / REPLAYED / CONFLICT_REJECTED
+let lastAuditId = null;      // 当前裁决对应的冻结审计标识（追溯接口据此只读重算）
 let selectedSeq = null;
+let originsCache = [];       // 当前审计的可追溯首发
 
 const $ = (s)=>document.querySelector(s);
 const toast = (msg, kind='') => { const t=$('#toast'); t.textContent=msg; t.className='toast '+kind; t.style.display='block';
@@ -308,15 +363,18 @@ $('#reopenBtn').onclick = async ()=>{
 function handleResult(http,json){
   if(http===400){ toast('录入校验失败：\n'+(json.errors||[]).map(e=>'· '+e.message).join('\n'),'err'); return; }
   if(json.status==='CONFLICT_REJECTED'){
-    lastStatus='CONFLICT_REJECTED'; lastVerdict=null;
+    lastStatus='CONFLICT_REJECTED'; lastVerdict=null; lastAuditId=null;
     renderConflict(json);
+    resetChain();
     toast('改动输入复用同一审计标识已被拒绝，原证据保留','err');
     loadCases();
     return;
   }
   lastStatus = json.status;
   lastVerdict = json.record.evidence.verdict;
+  lastAuditId = json.record.auditId;
   renderVerdict(json.record, json.status, json.message);
+  loadOrigins(json.record.auditId);
   loadCases();
   toast(json.message||'完成', json.record.evidence.verdict.verdict==='ACCEPTED'?'ok':'err');
 }
@@ -374,6 +432,9 @@ function renderVerdict(rec,status,message){
 function renderDetail(p,v){
   const extra = [];
   if(p.type==='CONNECT'){ /* flags shown in raw */ }
+  const traceEntry = (p.firstDelivery==='FIRST' && lastAuditId)
+    ? `<div class="btns" style="margin-top:10px"><button class="tracebtn" id="traceEntryBtn" style="padding:6px 12px;font-size:12.5px">🔗 追查此首发链路（第 ${p.seq} 包 · 包标识 ${p.packetId}）</button></div>`
+    : (p.type==='PUBLISH' && p.dup ? '<div class="muted" style="margin-top:8px">该包是 DUP=1 重发，不是首发；链路须从同标识最早的非 DUP PUBLISH 追查。</div>' : '');
   $('#detailBox').innerHTML = `
     <dl>
       <dt>包序号</dt><dd>第 ${p.seq} 包（第 ${p.connection} 条连接）</dd>
@@ -383,8 +444,11 @@ function renderDetail(p,v){
       <dt>首次交付状态</dt><dd>${ {FIRST:'首次发布（尚未交付应用）',RESEND:'断链重发（合法重放，Broker 去重，不重复交付）',DELIVERED_ONCE:'该遥测首次且唯一一次完成交付'}[p.firstDelivery]||'—' }</dd>
       <dt>审计说明</dt><dd>${esc(p.note||'—')}</dd>
     </dl>
+    ${traceEntry}
     ${p.violation?`<div class="vbox"><b>首个违规依据（${esc(p.violation.code)}）</b><br>${esc(p.violation.detail)}</div>`:
       (v.verdict==='REJECTED'?'': '<div class="muted" style="margin-top:8px">本包未发现违规。</div>')}`;
+  const btn = document.querySelector('#traceEntryBtn');
+  if(btn) btn.onclick = ()=>{ traceOrigin(p.seq); };
 }
 
 // ---------- 已固化案例 ----------
@@ -409,12 +473,154 @@ async function loadCases(){
           topic:p.topic??'',payload:p.payload??'',reasonCode:p.reasonCode??''}));
         renderRows();
         lastStatus='REPLAYED'; lastVerdict=g.record.evidence.verdict;
+        lastAuditId=g.record.auditId;
         renderVerdict(g.record,'REPLAYED','已从证据库回放原裁决');
+        loadOrigins(g.record.auditId);
         toast('已从证据库回放该审计标识的原裁决','ok');
       }
     };
     ul.appendChild(li);
   });
+}
+
+// ---------- 首发交换链路追查（只读接口） ----------
+function resetChain(){
+  originsCache = [];
+  $('#chainArea').style.display='none';
+  $('#originSelect').innerHTML='';
+  $('#chainBody').innerHTML='';
+  $('#chainRecov').innerHTML='';
+  $('#chainExcl').innerHTML='';
+  $('#chainTerm').innerHTML='';
+  document.querySelectorAll('#evBody tr').forEach(x=>x.classList.remove('activeTrace'));
+}
+
+async function loadOrigins(auditId){
+  resetChain();
+  if(!auditId) return;
+  try{
+    const r = await fetch('/api/audits/'+encodeURIComponent(auditId)+'/trace/origins');
+    const j = await r.json();
+    if(!r.ok){ toastChainError(j); return; }
+    originsCache = j.origins || [];
+    const sel = $('#originSelect');
+    sel.innerHTML = originsCache.length
+      ? originsCache.map((o,i)=>`<option value="${o.seq}">第 ${o.seq} 包首发 · 包标识 ${o.packetId} · 第 ${o.connection} 条连接${i>0?'（同标识另一首发）':''}</option>`).join('')
+      : '<option value="">无可追溯首发</option>';
+    $('#chainArea').style.display='block';
+    // 同标识多首发时给出明显提示
+    const byPid = {};
+    originsCache.forEach(o=>{ byPid[o.packetId]=(byPid[o.packetId]||0)+1; });
+    const dupPids = Object.keys(byPid).filter(k=>byPid[k]>1);
+    $('#chainHint').className='muted';
+    $('#chainHint').innerHTML = dupPids.length
+      ? `⚠ 本审计中包标识 [${dupPids.join(', ')}] 各出现多次首发（会话被 Clean Start 清除后复用）。选择不同首发得到<b>互不混淆</b>的独立链路。`
+      : '链路仅对冻结证据只读重算，不改写证据。选择首发并追查，查看跨连接衔接、确认关系与是否唯一交付。';
+  }catch(e){ toast('首发列表加载失败：'+e.message,'err'); }
+}
+
+function toastChainError(j){
+  const msg = j?.message || '链路查询失败';
+  $('#chainTerm').innerHTML = `<span class="term CAPTURE_END">查询被拒绝</span>`;
+  $('#chainBody').innerHTML = '';
+  $('#chainRecov').innerHTML = `<div class="note-box excl"><h4>明确反馈</h4><div class="vbox" style="margin-top:0">${esc(msg)}</div></div>`;
+  $('#chainExcl').innerHTML='';
+  $('#chainArea').style.display='block';
+}
+
+async function traceOrigin(seq){
+  if(!lastAuditId){ toast('请先提交或回放一个已固化裁决','err'); return; }
+  $('#originSelect').value = String(seq);
+  $('#traceBtn').click();
+}
+
+$('#traceBtn').onclick = async ()=>{
+  const seq = $('#originSelect').value;
+  if(!seq) return;
+  $('#chainRecov').innerHTML=''; $('#chainExcl').innerHTML=''; $('#chainTerm').innerHTML='';
+  let r, j;
+  try{
+    r = await fetch('/api/audits/'+encodeURIComponent(lastAuditId)+'/trace?seq='+encodeURIComponent(seq));
+    j = await r.json();
+  }catch(e){ toast('链路查询失败：'+e.message,'err'); return; }
+  if(!r.ok){ toastChainError(j); toast(j.message||'链路查询被拒绝','err'); return; }
+  renderChain(j.trace);
+};
+
+const ROLE_TEXT = {
+  FIRST_PUBLISH:'首发 PUBLISH', RESEND:'合法重发(DUP)', REUSE_AFTER_TERMINATION:'终止后重用',
+  ACK:'PUBREC 确认', RELAY:'PUBREL 释放', COMPLETE:'PUBCOMP 完成', SESSION_BOUNDARY:'会话边界'
+};
+const EFF_TEXT = {
+  FIRST_DELIVERY_CANDIDATE:'首发（交付候选）', DEDUPED_RESEND:'Broker 去重·不重复交付',
+  UNIQUE_DELIVERY:'唯一交付 ✓', REJECTED_BEFORE_DELIVERY:'二次交付尝试·被拦截'
+};
+const TERM_TEXT = {
+  CLOSED:'正常闭合（唯一交付）', REJECTED:'裁决拒绝（链路终止）',
+  CLEAN_START:'Clean Start 清除（旧链路终止）', CAPTURE_END:'捕获结束（未闭合）'
+};
+
+function renderChain(t){
+  document.querySelectorAll('#evBody tr').forEach(x=>x.classList.remove('activeTrace'));
+  const tr0 = [...document.querySelectorAll('#evBody tr')].find(x=>x.querySelector('.seq')?.textContent==String(t.origin.seq));
+  if(tr0) tr0.classList.add('activeTrace');
+
+  $('#chainTerm').innerHTML =
+    `<span class="term ${t.termination.kind}">终点：${TERM_TEXT[t.termination.kind]}${t.termination.seq?` @第 ${t.termination.seq} 包`:''}</span>` +
+    (t.deliveredOnce ? '<span class="term CLOSED">deliveredOnce=1</span>' : '<span class="term CAPTURE_END">deliveredOnce=0</span>');
+
+  const tb=$('#chainBody'); tb.innerHTML='';
+  t.steps.forEach(s=>{
+    const tr=document.createElement('tr');
+    if(s.role==='SESSION_BOUNDARY') tr.className='boundary';
+    if(s.violation) tr.className=(tr.className||'')+' terminal';
+    const dirTxt = s.role==='SESSION_BOUNDARY' ? '—' : s.direction;
+    const pidTxt = s.role==='SESSION_BOUNDARY' ? '—' : (s.packetId??'—');
+    const ackTxt = s.role==='SESSION_BOUNDARY' ? '—'
+      : (s.acknowledges!=null
+        ? (s.type==='PUBLISH' ? `重发自第 ${s.acknowledges} 包`
+           : s.type==='PUBREL' && t.steps.some(x=>x.type==='PUBREL' && x.seq===s.acknowledges) ? `重传自第 ${s.acknowledges} 包 PUBREL`
+           : `应答第 ${s.acknowledges} 包`)
+        : '—');
+    tr.innerHTML = `<td class="seq">${s.order}</td><td class="seq">${s.seq}</td>
+      <td class="conn">${s.connection||'—'}</td>
+      <td>${s.type}${s.dup?' <span class="badge warn">DUP</span>':''}</td>
+      <td>${dirTxt}</td><td>${pidTxt}</td>
+      <td>${esc(s.phase)}</td>
+      <td><span class="role-tag role-${s.role}">${ROLE_TEXT[s.role]||s.role}</span></td>
+      <td>${esc(ackTxt)}</td>
+      <td class="eff ${s.deliveryEffect||''}">${s.deliveryEffect?EFF_TEXT[s.deliveryEffect]:'—'}</td>`;
+    tr.title = s.note || '';
+    tb.appendChild(tr);
+  });
+
+  // 跨连接恢复说明
+  if(t.crossConnection && t.recovery.length){
+    $('#chainRecov').innerHTML = '<div class="note-box recov"><h4>🔗 跨连接衔接（持久会话恢复，沿用首次交付）</h4><ul>' +
+      t.recovery.map(r=>`<li><b>第 ${r.connection} 条连接</b>（CONNECT@${r.connectSeq}，CONNACK@${r.connackSeq}，
+        Clean Start=${r.cleanStart?1:0}，Session Present=${r.sessionPresent?1:0}${r.resumed?' · 恢复成功':''}）：${esc(r.note)}
+        ${r.retransmitted.length?`<br>重传报文：${r.retransmitted.map(x=>`第 ${x.seq} 包 ${x.type}`).join('、')}`:''}</li>`).join('') +
+      '</ul></div>';
+  } else {
+    $('#chainRecov').innerHTML='';
+  }
+
+  // 排除的同标识报文
+  if(t.excludedSameIdPackets.length){
+    $('#chainExcl').innerHTML = '<div class="note-box excl"><h4>同包标识但未并入本链路的报文（复用边界，防止证据混淆）</h4><ul>' +
+      t.excludedSameIdPackets.map(x=>`<li>第 ${x.seq} 包 ${x.type}（第 ${x.connection} 条连接${x.dup?' · DUP':''}）：${esc(x.reason)}</li>`).join('') +
+      '</ul></div>';
+  } else {
+    $('#chainExcl').innerHTML='';
+  }
+
+  if(t.termination.kind==='REJECTED'){
+    toast(`链路在第 ${t.termination.seq} 包被裁决拒绝：${t.termination.code}`,'err');
+  } else if(t.termination.kind==='CAPTURE_END'){
+    toast('链路至捕获结束仍未闭合','err');
+  } else {
+    toast(`已重建首发链路（${TERM_TEXT[t.termination.kind]}）`,'ok');
+  }
 }
 
 // init

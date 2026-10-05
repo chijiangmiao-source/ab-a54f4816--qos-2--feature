@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { EvidenceStore, StoreError } from './store.js';
-import { InputValidationError, REASON_CODES } from './engine.js';
+import { InputValidationError, REASON_CODES, traceExchange, traceableOrigins, TraceQueryError } from './engine.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 8080);
@@ -94,6 +94,59 @@ const server = createServer(async (req, res) => {
         return;
       }
       send(res, 200, { status: 'SEALED', record: rec });
+      return;
+    }
+
+    // 首发交换链路追溯（只读：仅对冻结证据的规范化原输入重算，不固化、不改写）
+    const mt = path.match(/^\/api\/audits\/([^/]+)\/trace$/);
+    if (req.method === 'GET' && mt) {
+      const rec = await store.get(decodeURIComponent(mt[1]));
+      if (!rec) {
+        send(res, 404, { status: 'NOT_FOUND', code: 'AUDIT_ID_NOT_FOUND', message: '该审计标识无已固化裁决，无法追溯交换链路' });
+        return;
+      }
+      const frozenInput = rec.evidence.normalizedInput;
+      try {
+        const seqParam = url.searchParams.get('seq');
+        if (seqParam === null || seqParam === '') {
+          throw new TraceQueryError('SEQ_REQUIRED', '必须提供首发序号查询参数 seq（可先从 .../trace/origins 获取可追溯首发列表）');
+        }
+        const trace = traceExchange(frozenInput, seqParam);
+        send(res, 200, { status: 'TRACED', auditId: rec.auditId, caseId: rec.caseId, sealedAt: rec.sealedAt, trace });
+      } catch (err) {
+        if (err instanceof InputValidationError) {
+          send(res, 400, { status: 'INVALID', code: 'INPUT_INVALID', errors: err.errors });
+          return;
+        }
+        if (err instanceof TraceQueryError) {
+          const status = err.code === 'SEQ_OUT_OF_RANGE' ? 400 : 422;
+          send(res, status, { status: 'TRACE_REJECTED', code: err.code, message: err.message, ...(err.packetCount != null ? { packetCount: err.packetCount } : {}) });
+          return;
+        }
+        throw err;
+      }
+      return;
+    }
+
+    // 可追溯首发列表（同一包标识多次首发时各自独立列出）
+    const mo = path.match(/^\/api\/audits\/([^/]+)\/trace\/origins$/);
+    if (req.method === 'GET' && mo) {
+      const rec = await store.get(decodeURIComponent(mo[1]));
+      if (!rec) {
+        send(res, 404, { status: 'NOT_FOUND', code: 'AUDIT_ID_NOT_FOUND', message: '该审计标识无已固化裁决，无法列出可追溯首发' });
+        return;
+      }
+      const { traceableOrigins } = await import('./engine.js');
+      try {
+        const origins = traceableOrigins(rec.evidence.normalizedInput);
+        send(res, 200, { status: 'OK', auditId: rec.auditId, origins });
+      } catch (err) {
+        if (err instanceof InputValidationError) {
+          send(res, 400, { status: 'INVALID', code: 'INPUT_INVALID', errors: err.errors });
+          return;
+        }
+        throw err;
+      }
       return;
     }
 

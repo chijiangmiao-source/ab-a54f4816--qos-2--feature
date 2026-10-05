@@ -9,8 +9,9 @@
   },
   "scripts": {
     "start": "node server/server.js",
-    "test": "node test/engine.test.js && node test/store.test.js",
+    "test": "node test/engine.test.js && node test/trace.test.js && node test/store.test.js",
     "test:engine": "node test/engine.test.js",
+    "test:trace": "node test/trace.test.js",
     "test:store": "node test/store.test.js",
     "check-page": "node scripts/check-page.js",
     "smoke": "node scripts/smoke.js",

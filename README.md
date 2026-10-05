@@ -6,7 +6,8 @@
 零运行时依赖（仅 Node.js 内置模块），提供：
 
 - 联调页面：录入**稳定审计标识**、**客户端标识**与**最多 48 条**按捕获顺序排列、带方向的
-  MQTT 5 控制包；逐包查看**会话阶段、包标识、首次交付状态、首个违规依据**；
+  MQTT 5 控制包；逐包查看**会话阶段、包标识、首次交付状态、首个违规依据**；冻结后可从任意
+  **首发 PUBLISH** 一键追查至闭合/拒绝/捕获结束的**有序交换链路**（跨重连衔接、确认关系、是否唯一交付）；
 - 裁决引擎：仅处理 `CONNECT / CONNACK / PUBLISH(QoS 2) / PUBREC / PUBREL / PUBCOMP / DISCONNECT`，
   在同一持久会话中依据 **Clean Start、Session Present、DUP、Packet Identifier**
   校验重连恢复、合法重放与未闭合交换；
@@ -36,15 +37,19 @@ echo $?        # 0 = 全部通过；非 0 = 存在失败
 verify 服务会等待 `app` 健康检查通过，然后顺序执行：
 
 1. **裁决引擎测试**（117 项，围绕重连闭合规则）；
-2. **证据库测试**（固化 / 同输入回放 / 改输入冲突拒绝且保留原证据 / 重启恢复 / 哈希链防篡改）；
-3. **页面构建检查**（需求要素齐全、内联脚本语法通过）；
-4. **API/HTTP 冒烟**：经真实 HTTP 验证
+2. **首发交换链路追溯测试**（68 项：正常闭合、跨重连恢复、标识复用边界、同标识多首发互不混淆、错误查询、只读性）；
+3. **证据库测试**（固化 / 同输入回放 / 改输入冲突拒绝且保留原证据 / 重启恢复 / 哈希链防篡改）；
+4. **页面构建检查**（需求要素齐全、内联脚本语法通过）；
+5. **API/HTTP 冒烟**：经真实 HTTP 验证
    - PUBREC 丢失后 DUP=1、载荷一致的合法重发 => `ACCEPTED` 且 `deliveredOnce=1`（仅一次交付）；
    - 闭合后重发 => `DOUBLE_DELIVERY` 拒绝并稳定定位违规包序号；
    - 重发载荷冲突 => `PAYLOAD_CONFLICT`；Clean Start 后继续旧确认 => `STALE_SESSION_USE`；
    - PUBCOMP 丢失后持久会话重连（SP=1）重传 PUBREL => 恢复闭合；
    - 不重连即结束 => `UNCLOSED_EXCHANGE`；
-   - 同标识同输入回放 `REPLAYED`，改输入复用标识 `409 CONFLICT_REJECTED` 且原证据不变。
+   - 同标识同输入回放 `REPLAYED`，改输入复用标识 `409 CONFLICT_REJECTED` 且原证据不变；
+   - **首发链路追溯**：正常闭合逐项链路、跨重连衔接（沿用首次交付）、闭合/清除后标识复用边界、
+     同标识多首发互不混淆，以及未知审计 `404` / 越界序号 `400` / 非首发与缺参 `422`，
+     且全部追溯查询只读、不新增或改写冻结证据。
 
 本地（无 Docker）等价命令：`sh scripts/verify.sh`。
 
@@ -57,6 +62,8 @@ verify 服务会等待 `app` 健康检查通过，然后顺序执行：
 | POST | `/api/audits/reopen` | 按审计标识重新打开（同输入回放；未知标识 `404`） |
 | GET | `/api/audits` | 已固化证据列表 |
 | GET | `/api/audits/:auditId` | 取回单条完整原证据 |
+| GET | `/api/audits/:auditId/trace/origins` | 列出该审计全部可追溯**首发** PUBLISH（同标识多次首发各自独立列出） |
+| GET | `/api/audits/:auditId/trace?seq=N` | 从第 N 包首发起只读重算并返回有序交换链路 |
 | GET | `/api/reason-codes` | 全部违规码及中文释义 |
 
 请求示例：
@@ -83,6 +90,34 @@ verify 服务会等待 `app` 健康检查通过，然后顺序执行：
 `DELIVERED_ONCE` 唯一交付）、`note`、`violation`；整体给出
 `verdict / reason / reasonSeq（首个违规包序号） / summary`。
 
+### 首发交换链路追查（冻结证据只读）
+
+审查重新打开已冻结审计后，若同一包标识在多个会话中出现，可先取可追溯首发列表，再逐条追查：
+
+```bash
+curl -s http://localhost:8080/api/audits/SAT-RELAY-20261004-01/trace/origins
+# {"status":"OK","origins":[{"seq":3,"packetId":22,"connection":1}, ...]}
+curl -s "http://localhost:8080/api/audits/SAT-RELAY-20261004-01/trace?seq=3"
+```
+
+链路从该**首发 PUBLISH** 起，按捕获顺序逐项返回到**闭合 / 拒绝 / Clean Start 清除 / 捕获结束**为止：
+
+- `steps[]`：`order`（链序）、`seq`（原始序号）、`connection`（连接编号）、`type/direction`、
+  `phase`（阶段变化）、`role`（首发 / 合法重发 / 确认 / 释放 / 完成 / 会话边界 / 终止后重用）、
+  `acknowledges`（应答或重传的前序包序号）、`deliveryEffect`（首发候选 / 去重不重复交付 /
+  唯一交付 / 二次交付被拦截）、违规依据；
+- `termination`：`CLOSED`（`deliveredOnce=true`，附 `uniqueDelivery.pubcompSeq`）、
+  `REJECTED`（含违规码与定位）、`CLEAN_START`（旧链路终止边界）、`CAPTURE_END`（未闭合）；
+- `connectionSpans / recovery`：跨连接衔接。持久会话以 **Clean Start=0、Session Present=1**
+  恢复时，重传的 `PUBREL`/`PUBLISH(DUP)` 明确标注**沿用首发的同一次交付**，不产生新交付；
+- `excludedSameIdPackets`：同一包标识但不属本链路的报文及原因——Clean Start 清除后的旧确认、
+  闭合后重用都只作为**前一链路的终止依据**，新会话的另一首发独立成链，互不混入。
+
+同一包标识出现多次首发时，对不同 `seq` 查询得到成员互不相交的独立链路；错误查询给出明确反馈且
+**绝不追加或改写冻结证据**：未知审计 `404 AUDIT_ID_NOT_FOUND`、序号越界 `400 SEQ_OUT_OF_RANGE`、
+目标包不是首发（DUP 重发/确认包等）`422 NOT_AN_ORIGIN`、缺少 `seq` `422 SEQ_REQUIRED`。
+联调页面在逐包证据的「首次发布」行提供“🔗 追查此首发链路”入口，并在第三区展示链路时间线。
+
 ## 四、裁决规则要点（违规码）
 
 | 违规码 | 含义 |
@@ -108,11 +143,11 @@ verify 服务会等待 `app` 健康检查通过，然后顺序执行：
 ## 五、目录结构
 
 ```
-server/engine.js   裁决引擎（纯函数：校验/规范化/指纹/状态机）
+server/engine.js   裁决引擎（纯函数：校验/规范化/指纹/状态机/首发链路追溯）
 server/store.js    仅追加哈希链证据库（固化/回放/冲突拒绝）
-server/server.js   零依赖 HTTP 服务（健康检查/API/静态页面）
-public/index.html  联调页面（录入、逐包证据、按标识重开、场景模板）
-test/              引擎与证据库测试（node 直接运行）
+server/server.js   零依赖 HTTP 服务（健康检查/API/链路追溯/静态页面）
+public/index.html  联调页面（录入、逐包证据、按标识重开、首发链路追查、场景模板）
+test/              引擎、链路追溯与证据库测试（node 直接运行）
 scripts/           verify.sh / check-page.js / smoke.js
 Dockerfile  docker-compose.yml  .env.example
 ```

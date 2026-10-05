@@ -35,6 +35,21 @@ check('含逐包证据区(会话阶段/包标识/首次交付/违规依据)',
 check('含已固化证据列表', /id="caseList"/.test(html));
 check('展示首个违规包序号', /reasonSeq|首个违规包序号/.test(html));
 
+// 首发交换链路追查要素
+check('含链路追查面板', /id="chainArea"/.test(html) && /首发交换链路追查/.test(html));
+check('含可追溯首发选择入口', /id="originSelect"/.test(html));
+check('含追查按钮', /id="traceBtn"/.test(html));
+check('含逐包首发追查入口按钮', /id="traceEntryBtn"/.test(html));
+check('链路逐项含原始序号/连接/阶段/确认关系/交付效果列',
+  /原始序号/.test(html) && /阶段变化/.test(html) && /确认\/重传关系/.test(html) && /交付效果/.test(html));
+check('含跨连接恢复说明容器', /id="chainRecov"/.test(html));
+check('含同标识排除依据容器', /id="chainExcl"/.test(html));
+check('调用链路追溯 API', html.includes('/trace?seq='));
+check('调用可追溯首发列表 API', html.includes('/trace/origins'));
+check('区分四类链路终点', ['CLOSED', 'REJECTED', 'CLEAN_START', 'CAPTURE_END'].every((k) =>
+  new RegExp(`['"]?${k}['"]?\\s*:`).test(html)));
+check('跨连接恢复沿用首次交付文案', /沿用首次交付|沿用第 .* 包首发的同一交付/.test(html));
+
 // 场景模板
 ['normal', 'pubrecLost', 'pubcompLost', 'double', 'cleanstart', 'payload', 'unclosed', 'direrr']
   .forEach((p) => check(`场景模板 ${p}`, html.includes(`data-preset="${p}"`)));
